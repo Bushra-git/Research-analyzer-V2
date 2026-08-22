@@ -1,0 +1,71 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                   String                 @id @default(cuid())
+  email                String?                @unique
+  name                 String?
+  passwordHash         String?                @map("password_hash")
+  createdAt            DateTime               @default(now())
+  analyses             Analysis[]
+  cachedRecommendations CachedRecommendation[]
+}
+
+model Analysis {
+  id              String   @id @default(cuid())
+  jobId           String?  @unique
+  userId          String?
+  paperFilename   String
+  extractedScore  Float
+  features        Json
+  summary         String   @db.Text
+  createdAt       DateTime @default(now())
+
+  user            User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+}
+
+model CachedRecommendation {
+  id              String   @id @default(cuid())
+  userId          String?
+  cacheKey        String   @unique
+  paperHash       String
+  preferencesHash String
+  requestPayload  Json
+  result          Json
+  createdAt       DateTime @default(now())
+  expiresAt       DateTime?
+
+  user            User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([paperHash])
+  @@index([preferencesHash])
+}
+
+model ReferencePaper {
+  id              BigInt   @id @default(autoincrement())
+  openalexId      String   @unique @map("openalex_id")
+  researchDomain  String   @map("research_domain")
+  title           String   @db.Text
+  abstract        String   @db.Text
+  authors         String[] @default([])
+  venueName       String?  @map("venue_name") @db.Text
+  venueType       String?  @map("venue_type")
+  venueIssn       String?  @map("venue_issn")
+  publicationYear Int?     @map("publication_year")
+  citationCount   Int      @default(0) @map("citation_count")
+  textContent     String   @map("text_content") @db.Text
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  @@index([publicationYear], map: "reference_papers_publication_year_idx")
+  @@index([citationCount], map: "reference_papers_citation_count_idx")
+  @@map("reference_papers")
+}
