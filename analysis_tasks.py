@@ -201,6 +201,28 @@ def extract_features(text: str) -> Dict[str, Any]:
         "readability": 50,
     }
 
+# Common research-paper section headings we look for. Matched at the start of a
+# line (allowing for numbering like "1." or "I.") so we don't false-positive on
+# the word appearing mid-sentence.
+_SECTION_PATTERNS = {
+    "Abstract": r"(?im)^\s*(?:[ivx\d]+[\.\)]\s*)?abstract\s*$",
+    "Introduction": r"(?im)^\s*(?:[ivx\d]+[\.\)]\s*)?introduction\s*$",
+    "Related Work": r"(?im)^\s*(?:[ivx\d]+[\.\)]\s*)?(related work|literature review|background)\s*$",
+    "Methods": r"(?im)^\s*(?:[ivx\d]+[\.\)]\s*)?(methods?|methodology|materials and methods)\s*$",
+    "Results": r"(?im)^\s*(?:[ivx\d]+[\.\)]\s*)?results?\s*$",
+    "Discussion": r"(?im)^\s*(?:[ivx\d]+[\.\)]\s*)?discussion\s*$",
+    "Conclusion": r"(?im)^\s*(?:[ivx\d]+[\.\)]\s*)?conclusions?\s*$",
+    "References": r"(?im)^\s*(?:[ivx\d]+[\.\)]\s*)?(references|bibliography)\s*$",
+}
+
+
+def detect_sections(text: str) -> list:
+    """Return the list of standard paper sections whose heading was found in the text."""
+    found = []
+    for section_name, pattern in _SECTION_PATTERNS.items():
+        if re.search(pattern, text):
+            found.append(section_name)
+    return found
 
 def extract_summary(text: str, max_sentences: int = 5) -> str:
     abstract_patterns = [
@@ -694,7 +716,54 @@ def build_score_explanation(text: str, features: Dict[str, Any], score: float) -
         "disclaimer": "This is an automated writing and structure estimate, not peer review.",
     }
 
+    
+def compute_quality_breakdown(text: str, features: Dict[str, Any], detected_sections: list) -> Dict[str, Any]:
+    """Independently-measured sub-scores (0-10), each from its own signal —
+    NOT derived by multiplying the overall score. Every field here should be
+    explainable on its own without reference to `score`.
+    """
+    word_count = int(features.get("word_count", 0))
+    sentence_count = int(features.get("sentence_count", 0))
 
+    if word_count == 0:
+        content_quality = 0.0
+    elif 2000 <= word_count <= 15000:
+        content_quality = 10.0
+    elif word_count < 2000:
+        content_quality = max(0.0, (word_count / 2000) * 10)
+    else:
+        overflow = word_count - 15000
+        content_quality = max(0.0, 10 - (overflow / 5000))
+
+    core_sections = {"Abstract", "Introduction", "Methods", "Results", "Discussion", "Conclusion"}
+    found_core = len(core_sections.intersection(detected_sections or []))
+    clarity_structure = min(10.0, (found_core / len(core_sections)) * 10)
+
+    citation_markers = len(re.findall(r"\[\d+\]|\b(cite|references?)\b", text, re.IGNORECASE))
+    evidence_citations = min(10.0, citation_markers / 2.0)
+
+    words = text.split()
+    unique_ratio = (len(set(words)) / len(words)) if words else 0.0
+    if unique_ratio < 0.3:
+        focus_relevance = (unique_ratio / 0.3) * 5
+    elif unique_ratio <= 0.7:
+        focus_relevance = 10.0
+    else:
+        focus_relevance = max(0.0, 10 - (unique_ratio - 0.7) * 20)
+
+    rigor = 0.0
+    avg_sentence_length = (word_count / sentence_count) if sentence_count else 0
+    rigor += 5.0 if 10 <= avg_sentence_length <= 30 else 2.0
+    rigor += 5.0 if re.search(r"\b(conclusion|discussion)\b", text, re.IGNORECASE) else 0.0
+    research_rigor = min(10.0, rigor)
+
+    return {
+        "content_quality": round(content_quality, 1),
+        "research_rigor": round(research_rigor, 1),
+        "clarity_structure": round(clarity_structure, 1),
+        "evidence_citations": round(evidence_citations, 1),
+        "focus_relevance": round(focus_relevance, 1),
+    }
 # -----------------------------
 # Main RQ task
 # -----------------------------
@@ -790,7 +859,11 @@ def process_paper_analysis(file_bytes: bytes, file_name: str = "uploaded.pdf") -
         reference_papers = []
         similar_papers = []
 
+    detected_sections = detect_sections(text)
+    quality_breakdown = compute_quality_breakdown(text, features, detected_sections)
+
     _set_stage("done")
+    
 
     return {
         "score": float(score),
@@ -802,5 +875,8 @@ def process_paper_analysis(file_bytes: bytes, file_name: str = "uploaded.pdf") -
         "score_explanation": score_explanation,
         "domain_stats": domain_stats,
         "file_name": file_name,
+        "detected_sections": detected_sections,
+        "sections_found": len(detected_sections),
+        "quality_breakdown": quality_breakdown,
     }
 

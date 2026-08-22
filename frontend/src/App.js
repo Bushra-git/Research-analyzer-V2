@@ -316,7 +316,9 @@ function App() {
               <div style={styles.resultsWrapper}>
                 {/* Success Message */}
                 <div style={styles.successBanner}>
-                  Valid research paper detected (6 sections found)
+                  {data.sections_found > 0
+                    ? `Valid research paper detected (${data.sections_found} section${data.sections_found === 1 ? "" : "s"} found: ${(data.detected_sections || []).join(", ")})`
+                    : "Paper analyzed (no standard section headings detected)"}
                 </div>
 
                 {/* Tabs */}
@@ -464,49 +466,49 @@ function App() {
                         </div>
                       </div>
 
-                      <h2 style={styles.sectionTitle}>Quality Score Breakdown</h2>
+                                            <h2 style={styles.sectionTitle}>Quality Score Breakdown</h2>
                       <p style={styles.tabDescription}>
-                        Your paper analyzed against 8+ quality dimensions from our venue database:
+                        Each dimension below is measured independently from your paper's content — not derived from the overall score:
                       </p>
                       <div style={styles.qualityBreakdown}>
                         <div style={styles.breakdownItem}>
                           <div style={styles.breakdownLabel}>Content Quality</div>
                           <div style={styles.breakdownBar}>
-                            <div style={{...styles.breakdownFill, width: `${Math.min(data.score * 12, 100)}%`, backgroundColor: '#3b82f6'}}></div>
+                            <div style={{...styles.breakdownFill, width: `${Math.min((data.quality_breakdown?.content_quality || 0) * 10, 100)}%`, backgroundColor: '#3b82f6'}}></div>
                           </div>
-                          <div style={styles.breakdownScore}>{(data.score).toFixed(1)}/10</div>
+                          <div style={styles.breakdownScore}>{(data.quality_breakdown?.content_quality ?? 0).toFixed(1)}/10</div>
                         </div>
 
                         <div style={styles.breakdownItem}>
                           <div style={styles.breakdownLabel}>Research Rigor</div>
                           <div style={styles.breakdownBar}>
-                            <div style={{...styles.breakdownFill, width: `${Math.min(data.score * 11.5, 100)}%`, backgroundColor: '#8b5cf6'}}></div>
+                            <div style={{...styles.breakdownFill, width: `${Math.min((data.quality_breakdown?.research_rigor || 0) * 10, 100)}%`, backgroundColor: '#8b5cf6'}}></div>
                           </div>
-                          <div style={styles.breakdownScore}>{(data.score * 1.15).toFixed(1)}/10</div>
+                          <div style={styles.breakdownScore}>{(data.quality_breakdown?.research_rigor ?? 0).toFixed(1)}/10</div>
                         </div>
 
                         <div style={styles.breakdownItem}>
                           <div style={styles.breakdownLabel}>Clarity & Structure</div>
                           <div style={styles.breakdownBar}>
-                            <div style={{...styles.breakdownFill, width: `${Math.min(data.score * 10.5, 100)}%`, backgroundColor: '#06b6d4'}}></div>
+                            <div style={{...styles.breakdownFill, width: `${Math.min((data.quality_breakdown?.clarity_structure || 0) * 10, 100)}%`, backgroundColor: '#06b6d4'}}></div>
                           </div>
-                          <div style={styles.breakdownScore}>{(data.score * 1.05).toFixed(1)}/10</div>
+                          <div style={styles.breakdownScore}>{(data.quality_breakdown?.clarity_structure ?? 0).toFixed(1)}/10</div>
                         </div>
 
                         <div style={styles.breakdownItem}>
                           <div style={styles.breakdownLabel}>Evidence & Citations</div>
                           <div style={styles.breakdownBar}>
-                            <div style={{...styles.breakdownFill, width: `${Math.min(data.score * 13, 100)}%`, backgroundColor: '#ec4899'}}></div>
+                            <div style={{...styles.breakdownFill, width: `${Math.min((data.quality_breakdown?.evidence_citations || 0) * 10, 100)}%`, backgroundColor: '#ec4899'}}></div>
                           </div>
-                          <div style={styles.breakdownScore}>{(data.score * 1.3).toFixed(1)}/10</div>
+                          <div style={styles.breakdownScore}>{(data.quality_breakdown?.evidence_citations ?? 0).toFixed(1)}/10</div>
                         </div>
 
                         <div style={styles.breakdownItem}>
                           <div style={styles.breakdownLabel}>Focus & Relevance</div>
                           <div style={styles.breakdownBar}>
-                            <div style={{...styles.breakdownFill, width: `${Math.min(data.score * 12.5, 100)}%`, backgroundColor: '#f59e0b'}}></div>
+                            <div style={{...styles.breakdownFill, width: `${Math.min((data.quality_breakdown?.focus_relevance || 0) * 10, 100)}%`, backgroundColor: '#f59e0b'}}></div>
                           </div>
-                          <div style={styles.breakdownScore}>{(data.score * 1.25).toFixed(1)}/10</div>
+                          <div style={styles.breakdownScore}>{(data.quality_breakdown?.focus_relevance ?? 0).toFixed(1)}/10</div>
                         </div>
                       </div>
 

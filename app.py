@@ -459,6 +459,19 @@ def generate_recommendations(text, features, score):
 
 @app.route("/predict", methods=["POST"])
 def predict():
+    """DEPRECATED: legacy synchronous analysis endpoint.
+
+    This route is NOT used by the frontend. The live analysis flow is:
+      React app -> POST /api/analyze (Node backend) -> enqueues a job on Redis/RQ
+      -> analysis_tasks.process_paper_analysis() (see analysis_tasks.py)
+      -> React app polls GET /api/status/:jobId until the job finishes.
+
+    /predict is kept only because it has its own test coverage
+    (tests/test_app_py.py) and removing it isn't worth the risk right now.
+    Do not add new features here — add them to analysis_tasks.py instead,
+    or this route's output (e.g. missing "reference_papers") will silently
+    drift out of sync with the real result shape the frontend expects.
+    """
     try:
         file = request.files.get("file")
 

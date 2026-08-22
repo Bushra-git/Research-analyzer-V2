@@ -49,6 +49,14 @@ model CachedRecommendation {
   @@index([preferencesHash])
 }
 
+model GuestUsage {
+  ip           String   @id
+  analysesUsed Int      @default(0) @map("analyses_used")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  @@map("guest_usage")
+}
+
 model ReferencePaper {
   id              BigInt   @id @default(autoincrement())
   openalexId      String   @unique @map("openalex_id")

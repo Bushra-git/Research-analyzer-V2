@@ -34,7 +34,6 @@ const FLASK_API_URL = process.env.FLASK_API_URL;
 const PORT = Number(process.env.BACKEND_PORT || process.env.PORT);
 const JWT_SECRET = process.env.JWT_SECRET;
 const GUEST_ANALYZE_LIMIT = Number(process.env.GUEST_ANALYZE_LIMIT || 2);
-const guestAnalyzeUsage = new Map();
 
 if (!FLASK_API_URL) {
   throw new Error("Missing FLASK_API_URL in backend environment");
@@ -98,12 +97,18 @@ const getClientIp = (req) => {
   return normalizeIp(req.ip || req.socket?.remoteAddress);
 };
 
-const getGuestAnalyzeUsage = (ip) => guestAnalyzeUsage.get(ip) || 0;
+const getGuestAnalyzeUsage = async (ip) => {
+  const record = await prisma.guestUsage.findUnique({ where: { ip } });
+  return record?.analysesUsed || 0;
+};
 
-const incrementGuestAnalyzeUsage = (ip) => {
-  const next = getGuestAnalyzeUsage(ip) + 1;
-  guestAnalyzeUsage.set(ip, next);
-  return next;
+const incrementGuestAnalyzeUsage = async (ip) => {
+  const record = await prisma.guestUsage.upsert({
+    where: { ip },
+    update: { analysesUsed: { increment: 1 } },
+    create: { ip, analysesUsed: 1 },
+  });
+  return record.analysesUsed;
 };
 
 app.post("/api/auth/register", apiRateLimiter, async (req, res) => {
