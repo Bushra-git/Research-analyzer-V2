@@ -11,14 +11,8 @@ function createFile(name = "paper.pdf", type = "application/pdf") {
 
 describe("App upload flow", () => {
   beforeEach(() => {
-    jest.useFakeTimers();
     axios.post.mockReset();
     axios.get.mockReset();
-  });
-
-  afterEach(() => {
-    jest.runOnlyPendingTimers();
-    jest.useRealTimers();
   });
 
   test("shows error when no file is selected", async () => {
@@ -86,11 +80,9 @@ describe("App upload flow", () => {
 
     // flush poll timeout chain
     await waitFor(() => {
-      expect(screen.getByText(/overall score/i)).toBeInTheDocument();
+      expect(screen.getByRole("heading", { name: /overall score/i })).toBeInTheDocument();
     });
-
-    // Ensure timer-based polling doesn't stall
-    jest.runOnlyPendingTimers();
+    
 
     await waitFor(() => {
       expect(screen.getByText("9")).toBeInTheDocument();
