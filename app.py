@@ -72,6 +72,18 @@ redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 redis_connection = Redis.from_url(redis_url)
 analysis_queue = Queue("analysis", connection=redis_connection)
 
+# Run RQ worker in a background thread (free-tier deploy workaround —
+# no separate paid worker dyno needed)
+import threading
+from rq import Worker
+
+def _start_background_worker():
+    worker_name = f"analysis-worker-{os.getpid()}"
+    worker = Worker([analysis_queue], connection=redis_connection, name=worker_name)
+    worker.work()
+
+if os.getenv("RUN_WORKER_IN_PROCESS", "true").lower() == "true":
+    threading.Thread(target=_start_background_worker, daemon=True).start()
 
 @app.route("/health", methods=["GET"])
 def health():
