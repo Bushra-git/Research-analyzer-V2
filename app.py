@@ -78,12 +78,19 @@ import threading
 from rq import Worker
 
 from rq.worker import SimpleWorker
+from rq.timeouts import BaseDeathPenalty
+
+class NoOpDeathPenalty(BaseDeathPenalty):
+    """Disables signal-based job timeouts, which don't work outside
+    the main thread. Safe trade-off for a single-worker free-tier deploy."""
+    def setup_death_penalty(self):
+        pass
+
+    def cancel_death_penalty(self):
+        pass
 
 class ThreadSafeWorker(SimpleWorker):
-    def _install_signal_handlers(self):
-        # Skip signal handling — only works in the main thread,
-        # and this worker runs in a background thread.
-        pass
+    death_penalty_class = NoOpDeathPenalty
 
 def _start_background_worker():
     worker_name = f"analysis-worker-{os.getpid()}"
