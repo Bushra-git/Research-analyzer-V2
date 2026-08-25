@@ -12,7 +12,9 @@ const { PrismaClient } = require("@prisma/client");
 require("dotenv").config();
 
 const app = express();
+app.set("trust proxy", 1);
 const prisma = new PrismaClient();
+
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "http://localhost:3000,http://localhost:3001")
   .split(",")
   .map((origin) => origin.trim())
@@ -249,7 +251,7 @@ app.post("/api/analyze", upload.single("file"), async (req, res) => {
     const isGuest = !user;
     const guestIp = isGuest ? getClientIp(req) : null;
 
-    if (isGuest && getGuestAnalyzeUsage(guestIp) >= GUEST_ANALYZE_LIMIT) {
+  if (isGuest && (await getGuestAnalyzeUsage(guestIp)) >= GUEST_ANALYZE_LIMIT) {
       return res.status(403).json({
         error: `Guest usage limit reached. You can analyze ${GUEST_ANALYZE_LIMIT} papers without login. Please sign in to continue.`,
         requiresAuth: true,
@@ -277,7 +279,7 @@ app.post("/api/analyze", upload.single("file"), async (req, res) => {
 
     // Flask /analyze returns { job_id, status, status_url }
     if (isGuest && guestIp) {
-      const used = incrementGuestAnalyzeUsage(guestIp);
+      const used = await incrementGuestAnalyzeUsage(guestIp);
       res.set("X-Guest-Analyses-Used", String(used));
       res.set("X-Guest-Analyses-Limit", String(GUEST_ANALYZE_LIMIT));
     }
