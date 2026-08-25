@@ -105,8 +105,8 @@ def health():
     redis_ok = False
     try:
         redis_ok = bool(redis_connection.ping())
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Redis health check failed: {e}")
 
     queue_count = 0
     try:
@@ -127,8 +127,8 @@ def health():
                 database_ok = True
             finally:
                 pool.putconn(connection)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Database health check failed: {e}")
 
     healthy = redis_ok and database_ok
     return jsonify(
@@ -194,7 +194,7 @@ DOMAIN_KEYWORDS_SIMPLE = {
     "Biomedical & Medicine": ["medical", "clinical", "disease", "health", "patient", "treatment", "diagnosis", "drug", "therapy", "biomedical"],
     "Physics & Materials": ["physics", "quantum", "particle", "material", "electromagnetic", "relativity"],
     "Chemistry": ["chemistry", "chemical", "reaction", "molecule", "compound", "synthesis", "organic"],
-    "Engineering": ["engineering", "mechanical", "electrical", "civil", "infrastructure", "infrastructure"],
+    "Engineering": ["engineering", "mechanical", "electrical", "civil", "infrastructure"],
     "Mathematics": ["mathematics", "mathematical", "proof", "theorem", "equation", "calculus"],
     "Economics & Business": ["economics", "economic", "business", "financial", "market", "trade"],
     "Environmental Science": ["environmental", "ecology", "sustainable", "pollution", "climate", "conservation"],
@@ -258,9 +258,12 @@ def extract_features(text):
             "readability": 50
         }
 
+    sentences = re.split(r"(?<=[.!?])\\s+", text.strip())
+    sentence_count = len([sentence for sentence in sentences if sentence])
+
     return {
         "word_count": len(words),
-        "sentence_count": text.count("."),
+        "sentence_count": sentence_count,
         "avg_word_length": sum(len(word) for word in words) / len(words),
         "readability": 50
     }
@@ -527,14 +530,14 @@ def predict():
         features_df = pd.DataFrame([features])
 
         # Get domain statistics
-        domain_stats = get_domain_stats(text)
+        domain_stats = get_domain_stats_app(text)
 
         # Check if model is loaded, use default score if not
         if model is None:
             print("Warning: Model not loaded, using default scoring")
             score = 6.5  # Default middle score
         else:
-            score = model.predict(features_df)[0]
+            score = float(model.predict(features_df)[0])
 
         # 🔥 repetition penalty
         words = text.split()
@@ -543,7 +546,7 @@ def predict():
             if unique_ratio < 0.4:
                 score -= 2
 
-        score = max(0, min(10, score))
+        score = max(0.0, min(10.0, float(score)))
 
         # Generate recommendations based on analysis
         recommendations = generate_recommendations(text, features, score)
@@ -566,8 +569,8 @@ def predict():
             # Strip debug-only breadcrumb
             for sp in similar_papers:
                 sp.pop("_used_full_set", None)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Similarity matching failed: {e}")
 
 
         result = {
@@ -724,5 +727,3 @@ def recommend():
 
 if __name__ == "__main__":
     app.run(host=flask_host, port=flask_port)
-
-
