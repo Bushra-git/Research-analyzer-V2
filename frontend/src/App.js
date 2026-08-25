@@ -14,7 +14,7 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [activeTab, setActiveTab] = useState("analysis");
-  const [user, setUser] = useState(null);
+  const [, setUser] = useState(null);  
   const [guestAnalysesUsed, setGuestAnalysesUsed] = useState(() => {
     const raw = localStorage.getItem(GUEST_ANALYZE_USAGE_KEY);
     const parsed = Number(raw || 0);
