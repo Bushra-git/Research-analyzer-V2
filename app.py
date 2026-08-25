@@ -73,12 +73,16 @@ redis_connection = Redis.from_url(redis_url)
 analysis_queue = Queue("analysis", connection=redis_connection)
 
 # Run RQ worker in a background thread (free-tier deploy workaround —
-# no separate paid worker dyno needed)
+# no separate paid worker dyno needed).
+#
+# RQ normally relies on OS signals (SIGALRM for job timeouts, SIGINT/SIGTERM
+# for graceful shutdown) which only work in the *main* thread of the *main*
+# interpreter. Since this worker runs in a background thread, both signal
+# paths must be disabled/no-op'd, or the worker crashes after starting.
 import threading
-from rq import Worker
-
 from rq.worker import SimpleWorker
 from rq.timeouts import BaseDeathPenalty
+
 
 class NoOpDeathPenalty(BaseDeathPenalty):
     """Disables signal-based job timeouts, which don't work outside
@@ -89,13 +93,21 @@ class NoOpDeathPenalty(BaseDeathPenalty):
     def cancel_death_penalty(self):
         pass
 
+
 class ThreadSafeWorker(SimpleWorker):
     death_penalty_class = NoOpDeathPenalty
+
+    def _install_signal_handlers(self):
+        # Skip SIGINT/SIGTERM handler registration — only works in the
+        # main thread, and this worker runs in a background thread.
+        pass
+
 
 def _start_background_worker():
     worker_name = f"analysis-worker-{os.getpid()}"
     worker = ThreadSafeWorker([analysis_queue], connection=redis_connection, name=worker_name)
     worker.work()
+
 
 if os.getenv("RUN_WORKER_IN_PROCESS", "true").lower() == "true":
     threading.Thread(target=_start_background_worker, daemon=True).start()
@@ -159,7 +171,7 @@ try:
     if not os.path.exists(csv_path):
         # Fallback to full dataset if active dataset not found
         csv_path = os.path.join(current_dir, "datasets", "ext_venues_full.csv")
-    
+
     if os.path.exists(csv_path):
         dataset = pd.read_csv(csv_path)
         print(f"[OK] Loaded new venue dataset: {len(dataset)} active venues")
@@ -258,7 +270,7 @@ def extract_features(text):
             "readability": 50
         }
 
-    sentences = re.split(r"(?<=[.!?])\\s+", text.strip())
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
     sentence_count = len([sentence for sentence in sentences if sentence])
 
     return {
@@ -333,7 +345,7 @@ def extract_summary(text, max_sentences=5):
         r'(?i)abstract\s*\n(.*?)(?=\n\n[A-Z])',
         r'(?i)abstract:(.*?)(?=introduction|1\.|keywords)',
     ]
-    
+
     for pattern in abstract_patterns:
         match = re.search(pattern, text, re.DOTALL)
         if match:
@@ -342,18 +354,18 @@ def extract_summary(text, max_sentences=5):
             abstract = ' '.join(abstract.split())
             if len(abstract) > 100:  # Only use if substantial
                 return abstract[:500] + "..." if len(abstract) > 500 else abstract
-    
+
     # If no abstract found, use extractive summarization
     sentences = re.split(r'(?<=[.!?])\s+', text)
     sentences = [s.strip() for s in sentences if len(s.strip()) > 20]
-    
+
     if len(sentences) == 0:
         return "Unable to extract summary from the paper."
-    
+
     # Score sentences based on word frequency
     words = re.findall(r'\w+', text.lower())
     word_freq = Counter(words)
-    
+
     # Remove common stop words
     stop_words = {
         'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
@@ -362,7 +374,7 @@ def extract_summary(text, max_sentences=5):
         'this', 'that', 'these', 'those', 'i', 'you', 'he', 'she', 'it', 'we',
         'they', 'what', 'which', 'who', 'when', 'where', 'why', 'how'
     }
-    
+
     # Calculate sentence scores
     sentence_scores = {}
     for i, sentence in enumerate(sentences[:50]):  # Consider first 50 sentences
@@ -372,18 +384,18 @@ def extract_summary(text, max_sentences=5):
             if word not in stop_words:
                 score += word_freq.get(word, 0)
         sentence_scores[i] = score
-    
+
     # Get top sentences
     top_sentence_indices = sorted(sentence_scores, key=sentence_scores.get, reverse=True)[:max_sentences]
     top_sentence_indices.sort()  # Maintain order
-    
+
     summary_sentences = [sentences[i] for i in top_sentence_indices]
     summary = ' '.join(summary_sentences)
-    
+
     # Limit summary length
     if len(summary) > 500:
         summary = summary[:500] + "..."
-    
+
     return summary
 
 # Generate recommendations based on paper analysis
@@ -395,7 +407,7 @@ def generate_recommendations(text, features, score):
     word_count = features.get("word_count", 0)
     sentence_count = features.get("sentence_count", 0)
     avg_word_length = features.get("avg_word_length", 0)
-    
+
     # Word count analysis
     if word_count < 2000:
         recommendations.append({
@@ -412,7 +424,7 @@ def generate_recommendations(text, features, score):
             "title": "Content Length",
             "description": f"Your paper's word count ({word_count} words) is within a good range for research papers. Focus on maintaining quality over quantity."
         })
-    
+
     # Sentence structure analysis
     if word_count > 0 and sentence_count > 0:
         avg_sentence_length = word_count / sentence_count
@@ -426,7 +438,7 @@ def generate_recommendations(text, features, score):
                 "title": "Enhance Sentence Variety",
                 "description": f"Average sentence length is {avg_sentence_length:.1f} words. Try varying sentence length and structure to improve flow and maintain reader engagement."
             })
-    
+
     # Vocabulary analysis
     if avg_word_length < 4.5:
         recommendations.append({
@@ -438,7 +450,7 @@ def generate_recommendations(text, features, score):
             "title": "Improve Clarity",
             "description": f"Average word length is {avg_word_length:.1f} characters. Some words may be overly complex. Balance technical terminology with clear explanations for accessibility."
         })
-    
+
     # Score-based recommendations
     if score < 5:
         recommendations.append({
@@ -460,7 +472,7 @@ def generate_recommendations(text, features, score):
             "title": "Excellent Work",
             "description": "Your paper demonstrates high quality. Consider submitting to peer-reviewed venues or academic conferences. Continue maintaining this level of academic rigor."
         })
-    
+
     # Repetition analysis
     words = text.split()
     if len(words) > 0:
@@ -470,20 +482,20 @@ def generate_recommendations(text, features, score):
                 "title": "Reduce Repetition",
                 "description": "Your paper shows significant word repetition. Use synonyms and varied expressions to improve readability and maintain reader interest throughout the paper."
             })
-    
+
     # Check for common issues
     if "conclusion" not in text.lower():
         recommendations.append({
             "title": "Add Conclusion Section",
             "description": "Your paper appears to lack a formal conclusion. Add a strong conclusion section that summarizes findings, implications, and suggests future research directions."
         })
-    
+
     if len(re.findall(r'\[\d+\]|cite|ref', text, re.IGNORECASE)) < 5:
         recommendations.append({
             "title": "Increase Citations",
             "description": "Your paper has minimal citations. Strengthen your research by citing relevant literature and establishing connections to existing work in your field."
         })
-    
+
     return recommendations
 
 
@@ -588,7 +600,7 @@ def predict():
         cache_set_json(f"analysis:{file_hash}", result, 24 * 60 * 60)
 
         return jsonify(result)
-    
+
     except Exception as e:
 
         print(f"Error in predict endpoint: {str(e)}")
