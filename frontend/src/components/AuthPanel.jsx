@@ -1,6 +1,17 @@
 import { useState } from "react";
 import axios from "axios";
 
+const USER_STORAGE_KEY = "research_analyzer_user";
+
+function readStoredUser() {
+  try {
+    const raw = localStorage.getItem(USER_STORAGE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (error) {
+    return null;
+  }
+}
+
 function AuthPanel({ apiBaseUrl, onAuthenticated, guestAnalysesUsed = 0, guestAnalyzeLimit = 2 }) {
   const [mode, setMode] = useState("login");
   const [email, setEmail] = useState("");
@@ -8,6 +19,7 @@ function AuthPanel({ apiBaseUrl, onAuthenticated, guestAnalysesUsed = 0, guestAn
   const [name, setName] = useState("");
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(false);
+  const [currentUser, setCurrentUser] = useState(readStoredUser);
   const hasSession = Boolean(localStorage.getItem("research_analyzer_token"));
 
   const submit = async (event) => {
@@ -23,8 +35,12 @@ function AuthPanel({ apiBaseUrl, onAuthenticated, guestAnalysesUsed = 0, guestAn
         ...(mode === "register" ? { name } : {}),
       });
       localStorage.setItem("research_analyzer_token", response.data.token);
+      localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(response.data.user));
+      setCurrentUser(response.data.user);
       onAuthenticated(response.data.user);
-      setMessage(`Signed in as ${response.data.user.email}`);
+      setEmail("");
+      setPassword("");
+      setName("");
     } catch (error) {
       setMessage(error.response?.data?.error || "Authentication failed");
     } finally {
@@ -34,9 +50,31 @@ function AuthPanel({ apiBaseUrl, onAuthenticated, guestAnalysesUsed = 0, guestAn
 
   const signOut = () => {
     localStorage.removeItem("research_analyzer_token");
+    localStorage.removeItem(USER_STORAGE_KEY);
+    setCurrentUser(null);
     onAuthenticated(null);
     setMessage("Signed out");
   };
+
+  // Once logged in, show a welcome message instead of the sign-in form
+  if (hasSession && currentUser) {
+    const displayName = currentUser.name || currentUser.email;
+
+    return (
+      <div style={styles.wrap}>
+        <div style={styles.welcomeBox}>
+          <div style={styles.welcomeGreeting}>Welcome, {displayName} 👋</div>
+          <div style={styles.welcomeEmail}>{currentUser.email}</div>
+        </div>
+
+        <button type="button" onClick={signOut} style={styles.signOutButton}>
+          Sign out
+        </button>
+
+        {message && <small style={styles.message}>{message}</small>}
+      </div>
+    );
+  }
 
   return (
     <div style={styles.wrap}>
@@ -86,12 +124,6 @@ function AuthPanel({ apiBaseUrl, onAuthenticated, guestAnalysesUsed = 0, guestAn
           {mode === "login" ? "Need an account? Register" : "Already registered? Sign in"}
         </button>
 
-        {hasSession && (
-          <button type="button" onClick={signOut} style={styles.signOutButton}>
-            Sign out
-          </button>
-        )}
-
         {message && <small style={styles.message}>{message}</small>}
       </form>
     </div>
@@ -111,6 +143,24 @@ const styles = {
     color: "#334155",
     background: "#f8fafc",
     border: "1px solid rgba(148, 163, 184, 0.35)",
+  },
+  welcomeBox: {
+    padding: "14px 16px",
+    borderRadius: "10px",
+    background: "linear-gradient(135deg, rgba(59, 130, 246, 0.08) 0%, rgba(37, 99, 235, 0.08) 100%)",
+    border: "1px solid rgba(59, 130, 246, 0.25)",
+    marginBottom: "10px",
+  },
+  welcomeGreeting: {
+    fontSize: "15px",
+    fontWeight: "700",
+    color: "#1e293b",
+    marginBottom: "4px",
+  },
+  welcomeEmail: {
+    fontSize: "12px",
+    color: "#64748b",
+    fontWeight: "500",
   },
   form: {
     display: "flex",
