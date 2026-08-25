@@ -12,7 +12,7 @@ const { PrismaClient } = require("@prisma/client");
 require("dotenv").config();
 
 const app = express();
-app.set("trust proxy", true);
+app.set("trust proxy", 1);
 const prisma = new PrismaClient();
 
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "http://localhost:3000,http://localhost:3001")
@@ -66,7 +66,7 @@ app.use(
 // Polling (/api/status/:jobId) is intentionally excluded because it is frequent/low-cost.
 const apiRateLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 300,
+  max: 1000,
   standardHeaders: true,
   legacyHeaders: false,
 });
