@@ -77,11 +77,17 @@ analysis_queue = Queue("analysis", connection=redis_connection)
 import threading
 from rq import Worker
 
+class ThreadSafeWorker(Worker):
+    def _install_signal_handlers(self):
+        # Skip signal handling — only works in the main thread,
+        # and this worker runs in a background thread.
+        pass
+
 def _start_background_worker():
     worker_name = f"analysis-worker-{os.getpid()}"
-    worker = Worker([analysis_queue], connection=redis_connection, name=worker_name)
+    worker = ThreadSafeWorker([analysis_queue], connection=redis_connection, name=worker_name)
     worker.work()
-
+    
 if os.getenv("RUN_WORKER_IN_PROCESS", "true").lower() == "true":
     threading.Thread(target=_start_background_worker, daemon=True).start()
 
