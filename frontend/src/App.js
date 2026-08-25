@@ -31,7 +31,10 @@ function App() {
 
   const pollAnalysisStatus = async (jobId) => {
     try {
-      const response = await axios.get(`${API_BASE_URL}/api/status/${jobId}`, { headers: authHeaders() });
+      const response = await axios.get(`${API_BASE_URL}/api/status/${jobId}`, {
+        headers: { ...authHeaders(), "Cache-Control": "no-cache" },
+        params: { _t: Date.now() },
+      });
       const status = response.data?.status;
 
       if (status === "finished" && response.data?.result) {
@@ -170,12 +173,8 @@ function App() {
                   setError(null);
                 }}
               />
-              {user && <small style={styles.accountBadge}>Account: {user.email}</small>}
-              {!isAuthenticated && (
-                <div style={isGuestLimitReached ? styles.guestLimitWarning : styles.guestLimitNotice}>
-                  Free analyses used: {Math.min(guestAnalysesUsed, GUEST_ANALYZE_LIMIT)}/{GUEST_ANALYZE_LIMIT}
-                </div>
-              )}
+              
+              
 
               <label style={styles.fileInputLabel}>
                 <input
@@ -858,7 +857,10 @@ const styles = {
 
   fileInputLabel: {
     display: "block",
+    marginTop: "18px",
     marginBottom: "16px",
+    paddingTop: "18px",
+    borderTop: "1px solid rgba(30, 41, 59, 0.08)",
   },
 
   fileInput: {
@@ -869,15 +871,14 @@ const styles = {
     display: "block",
     textAlign: "center",
     padding: "10px 16px",
-    background: "linear-gradient(135deg, #3b82f6 0%, #2563eb 100%)",
-    color: "#ffffff",
-    border: "none",
+    background: "#ffffff",
+    color: "#334155",
+    border: "1.5px solid #cbd5e1",
     borderRadius: "8px",
     cursor: "pointer",
     fontWeight: "600",
     fontSize: "13px",
-    transition: "all 0.3s cubic-bezier(0.4, 0, 0.2, 1)",
-    boxShadow: "0 4px 12px rgba(59, 130, 246, 0.3)",
+    transition: "all 0.2s ease",
   },
 
   fileName: {
