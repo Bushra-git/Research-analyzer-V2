@@ -295,6 +295,7 @@ app.post("/api/analyze", upload.single("file"), async (req, res) => {
 });
 
 app.get("/api/status/:jobId", async (req, res) => {
+  res.set("Cache-Control", "no-store");
   try {
     const response = await axios.get(`${FLASK_API_URL}/status/${req.params.jobId}`, {
       timeout: 120000,
