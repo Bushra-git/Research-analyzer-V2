@@ -28,6 +28,63 @@ jobs:
         run: |
           python -m pytest -q
 
+  node-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm ci
+        working-directory: backend
+      - run: npm test
+        working-directory: backend
+      - run: npx prisma validate
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://research:test@localhost:5432/research
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: research
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: research
+        ports: ['5432:5432']
+        options: --health-cmd pg_isready --health-interval 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+    env:
+      DATABASE_URL: postgresql://research:test@localhost:5432/research
+      REDIS_URL: redis://localhost:6379/0
+      JWT_SECRET: ci-only-jwt-secret-not-for-production-123456
+      INTERNAL_API_TOKEN: ci-only-internal-secret-not-for-production-123456
+      FLASK_API_URL: http://localhost:5000
+      BACKEND_PORT: '3001'
+      SEMANTIC_SIMILARITY_ENABLED: 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: pip install -r requirements.txt
+      - run: npm ci && npx prisma generate && npx prisma migrate deploy
+        working-directory: backend
+      - name: Start disposable services and exercise real workflow
+        run: |
+          gunicorn --bind 127.0.0.1:5000 --workers 1 --threads 2 app:app > flask.log 2>&1 &
+          python worker.py > worker.log 2>&1 &
+          node backend/server.js > backend.log 2>&1 &
+          for i in $(seq 1 30); do curl -fsS http://localhost:3001/api/session >/dev/null && break || sleep 1; done
+          python scripts/integration_smoke.py
+
   frontend-tests:
     runs-on: ubuntu-latest
     defaults:

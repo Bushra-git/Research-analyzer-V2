@@ -168,7 +168,7 @@ def get_domain_stats(text: str, dataset: Optional[pd.DataFrame] = None) -> Dict[
             domain_stats["oa_count"] = int(ds["Is_Open_Access"].fillna(False).astype(bool).sum())
         else:
             oa_series = ds.get("Open Access Status", pd.Series(dtype=object))
-            domain_stats["oa_count"] = len(oa_series.astype(str).str.contains("OA|open access", case=False, na=False))
+            domain_stats["oa_count"] = int(oa_series.astype(str).str.contains("OA|open access", case=False, na=False).sum())
     except Exception:
         domain_stats["oa_count"] = 0
 
@@ -186,7 +186,7 @@ def get_domain_stats(text: str, dataset: Optional[pd.DataFrame] = None) -> Dict[
 
         else:
             med_series = ds.get("Medline Coverage", pd.Series(dtype=object))
-            domain_stats["medline_count"] = len(med_series.astype(str).str.contains("Yes|Indexed", case=False, na=False))
+            domain_stats["medline_count"] = int(med_series.astype(str).str.contains("Yes|Indexed", case=False, na=False).sum())
     except Exception:
         domain_stats["medline_count"] = 0
 
@@ -196,7 +196,7 @@ def get_domain_stats(text: str, dataset: Optional[pd.DataFrame] = None) -> Dict[
             domain_stats["active_count"] = int(ds["Is_Active"].fillna(False).astype(bool).sum())
         else:
             status_series = ds.get("Active or Inactive", pd.Series(dtype=object))
-            domain_stats["active_count"] = len(status_series.astype(str).str.contains("active", case=False, na=False))
+            domain_stats["active_count"] = int(status_series.fillna('').astype(str).str.strip().str.lower().eq('active').sum())
     except Exception:
         domain_stats["active_count"] = 0
 

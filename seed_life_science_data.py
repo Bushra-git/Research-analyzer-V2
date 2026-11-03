@@ -1,5 +1,6 @@
 import os
 import time
+from datetime import datetime, timezone
 from typing import Dict, List
 
 import requests
@@ -81,6 +82,8 @@ def fetch_openalex_records(max_records: int, search: str = "") -> List[Dict]:
                 "sort": "cited_by_count:desc",
             }
 
+        if os.getenv('OPENALEX_API_KEY'):
+            params['api_key'] = os.environ['OPENALEX_API_KEY']
         response = requests.get(OPENALEX_URL, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
         response.raise_for_status()
 
@@ -203,6 +206,7 @@ def upsert_reference_papers(pool: SimpleConnectionPool, records: List[Dict]) -> 
                 rec["publication_year"],
                 rec["citation_count"],
                 rec["text_content"],
+                datetime.now(timezone.utc),
             )
             for rec in records
             if rec.get("openalex_id") and rec.get("title") and rec.get("abstract")
@@ -225,11 +229,15 @@ def upsert_reference_papers(pool: SimpleConnectionPool, records: List[Dict]) -> 
                 venue_issn,
                 publication_year,
                 citation_count,
-                text_content
+                text_content,
+                updated_at
             )
             VALUES %s
             ON CONFLICT (openalex_id)
             DO UPDATE SET
+                title = EXCLUDED.title,
+                venue_name = EXCLUDED.venue_name,
+                publication_year = EXCLUDED.publication_year,
                 abstract = EXCLUDED.abstract,
                 research_domain = EXCLUDED.research_domain,
                 authors = EXCLUDED.authors,

@@ -6,7 +6,7 @@ WORKDIR /app
 RUN apk add --no-cache openssl
 
 COPY package*.json ./
-RUN npm install
+RUN npm ci
 
 
 # Copy prisma schema + sources before generating Prisma client
@@ -18,4 +18,4 @@ RUN npx prisma generate
 
 EXPOSE 3001
 
-CMD ["node", "server.js"]
+CMD ["sh", "-c", "npx prisma migrate deploy && node server.js"]

@@ -1,5 +1,14 @@
 node_modules/
+.venv/
+.tools/
+.npm-cache/
+models/all-MiniLM-L6-v2/
+frontend/build/
+*.log
 __pycache__/
 *.pyc
 .env
- model.pkl 
+.env.*
+!.env.example
+.pytest_cache/
+model.pkl

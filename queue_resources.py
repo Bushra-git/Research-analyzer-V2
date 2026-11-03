@@ -6,6 +6,8 @@ app.py import-time side effects.
 """
 
 import os
+from dotenv import load_dotenv
+load_dotenv()
 
 from redis import Redis
 from rq import Queue

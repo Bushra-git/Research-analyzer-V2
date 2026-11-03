@@ -1,741 +1,174 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-
-import pickle
-import pandas as pd
-import fitz
+"""Private HTTP boundary. Only the authenticated Node gateway may access jobs."""
+import hashlib
+import hmac
+import json
 import os
 import re
-import json
-import hashlib
-from collections import Counter
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
-from redis import Redis
-from rq import Queue
-from rq import Retry
+import uuid
+from functools import lru_cache
+
+from dotenv import load_dotenv
+load_dotenv()
+from flask import Flask, jsonify, request
+from redis.exceptions import RedisError
+from rq import Worker
 from rq.job import Job
 from rq.exceptions import NoSuchJobError
-
-from analysis_tasks import process_paper_analysis
-
-try:
-    from reference_papers_similarity import get_reference_similar_papers
-except Exception:
-    def get_reference_similar_papers(_paper_text, top_k=5):
-        return []
-
-# Import enhanced recommender with ASJC-based scoring (v2 with proper dataset integration)
-# In CI/test environments, sklearn/scipy wheels may be incompatible with the installed NumPy.
-# In that case, importing the recommender can fail with non-ImportError exceptions.
-try:
-    from recommender_full import load_venue_database_enhanced, recommend_venues_enhanced
-except Exception:
-    try:
-        from recommender_lite import load_venue_database_enhanced, recommend_venues_enhanced
-    except Exception:
-        load_venue_database_enhanced = None
-        recommend_venues_enhanced = None
-
-try:
-    from sklearn.feature_extraction.text import TfidfVectorizer
-except Exception:  # pragma: no cover
-    TfidfVectorizer = None
-
-
-# Cache TTL defaults (24h for analysis, 24h for recommendations by default)
-
-ANALYSIS_CACHE_TTL_SECONDS = int(os.getenv("ANALYSIS_CACHE_TTL_SECONDS", 24 * 60 * 60))
-RECOMMENDATION_CACHE_TTL_SECONDS = int(os.getenv("RECOMMENDATION_CACHE_TTL_SECONDS", 24 * 60 * 60))
-
+from rq.command import send_stop_job_command
+from queue_resources import analysis_queue, redis_connection
+from analysis_tasks import ANALYSIS_VERSION, process_uploaded_paper
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("MAX_UPLOAD_BYTES", 15 * 1024 * 1024))
-allowed_origins = [origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:3001").split(",") if origin.strip()]
-CORS(app, origins=allowed_origins)
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
+TTL = int(os.getenv('RETENTION_HOURS', '24')) * 3600
 
+@app.before_request
+def authenticate_gateway():
+    secret = os.getenv('INTERNAL_API_TOKEN', '')
+    if len(secret) < 32:
+        return jsonify(error='Internal authentication is not configured'), 503
+    if not hmac.compare_digest(request.headers.get('X-Internal-Token', ''), secret):
+        return jsonify(error='Unauthorized'), 401
+    if request.path != '/health' and not re.fullmatch(r'(user|guest):[A-Za-z0-9_-]{1,100}', request.headers.get('X-Owner-Key', '')):
+        return jsonify(error='Owner identity required'), 401
 
 @app.after_request
-def add_security_headers(response):
-    response.headers.setdefault("X-Content-Type-Options", "nosniff")
-    response.headers.setdefault("X-Frame-Options", "DENY")
-    response.headers.setdefault("Referrer-Policy", "no-referrer")
+def private_response(response):
+    response.headers['Cache-Control'] = 'no-store'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
     return response
 
-# NOTE: ensure the Flask server binds to the configured host/port in Docker
-flask_host = os.getenv("FLASK_HOST", "0.0.0.0")
-flask_port = int(os.getenv("FLASK_PORT", "5000"))
-redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-redis_connection = Redis.from_url(redis_url)
-analysis_queue = Queue("analysis", connection=redis_connection)
-
-# Run RQ worker in a background thread (free-tier deploy workaround —
-# no separate paid worker dyno needed).
-#
-# RQ normally relies on OS signals (SIGALRM for job timeouts, SIGINT/SIGTERM
-# for graceful shutdown) which only work in the *main* thread of the *main*
-# interpreter. Since this worker runs in a background thread, both signal
-# paths must be disabled/no-op'd, or the worker crashes after starting.
-import threading
-from rq.worker import SimpleWorker
-from rq.timeouts import BaseDeathPenalty
-
-
-class NoOpDeathPenalty(BaseDeathPenalty):
-    """Disables signal-based job timeouts, which don't work outside
-    the main thread. Safe trade-off for a single-worker free-tier deploy."""
-    def setup_death_penalty(self):
-        pass
-
-    def cancel_death_penalty(self):
-        pass
-
-
-class ThreadSafeWorker(SimpleWorker):
-    death_penalty_class = NoOpDeathPenalty
-
-    def _install_signal_handlers(self):
-        # Skip SIGINT/SIGTERM handler registration — only works in the
-        # main thread, and this worker runs in a background thread.
-        pass
-
-
-def _start_background_worker():
-    worker_name = f"analysis-worker-{os.getpid()}"
-    worker = ThreadSafeWorker([analysis_queue], connection=redis_connection, name=worker_name)
-    worker.work()
-
-
-if os.getenv("RUN_WORKER_IN_PROCESS", "true").lower() == "true":
-    threading.Thread(target=_start_background_worker, daemon=True).start()
-
-@app.route("/health", methods=["GET"])
-def health():
-    redis_ok = False
+def owned_job(job_id):
     try:
-        redis_ok = bool(redis_connection.ping())
-    except Exception as e:
-        print(f"Redis health check failed: {e}")
-
-    queue_count = 0
-    try:
-        queue_count = int(analysis_queue.count)
-    except Exception:
-        queue_count = 0
-
-    database_ok = False
-    try:
-        from reference_papers_similarity import _get_pool
-
-        pool = _get_pool()
-        if pool is not None:
-            connection = pool.getconn()
-            try:
-                with connection.cursor() as cursor:
-                    cursor.execute("SELECT 1")
-                database_ok = True
-            finally:
-                pool.putconn(connection)
-    except Exception as e:
-        print(f"Database health check failed: {e}")
-
-    healthy = redis_ok and database_ok
-    return jsonify(
-        {
-            "status": "ok" if healthy else "degraded",
-            "redis": redis_ok,
-            "database": database_ok,
-            "queue": queue_count,
-        }
-    ), (200 if healthy else 503)
-
-
-# Get the directory of the current file
-current_dir = os.path.dirname(os.path.abspath(__file__))
-
-# Load model with error handling
-try:
-    model_path = os.path.join(current_dir, "model.pkl")
-    model = pickle.load(open(model_path, "rb"))
-except Exception as e:
-    print(f"Error loading model: {e}")
-    model = None
-
-# Load new venue dataset (ext_list_Jan_2026)
-try:
-    # Try to load preprocessed venues first (from new dataset)
-    csv_path = os.path.join(current_dir, "datasets", "ext_venues_active.csv")
-    if not os.path.exists(csv_path):
-        # Fallback to full dataset if active dataset not found
-        csv_path = os.path.join(current_dir, "datasets", "ext_venues_full.csv")
-
-    if os.path.exists(csv_path):
-        dataset = pd.read_csv(csv_path)
-        print(f"[OK] Loaded new venue dataset: {len(dataset)} active venues")
-    else:
-        # Keep existing behavior for backward compatibility
-        csv_path = os.path.join(current_dir, "arxiv_clean.csv")
-        dataset = pd.read_csv(csv_path)
-        dataset = dataset.dropna().head(100)
-except Exception as e:
-    print(f"Error loading dataset: {e}")
-    dataset = pd.DataFrame()
-
-
-
-
-
-# Load venue database for recommendations
-try:
-    venue_db = load_venue_database_enhanced()
-    print(f"[OK] Enhanced venue database loaded with {len(venue_db)} venues")
-except Exception as e:
-    print(f"Warning: Could not load venue database: {e}")
-    venue_db = None
-
-# Load TF-IDF vectorizer for recommendation topic matching
-global_vectorizer = None
-
-
-# Domain keywords for paper classification
-DOMAIN_KEYWORDS_SIMPLE = {
-    "Computer Science & AI": ["machine learning", "ai", "artificial intelligence", "neural network", "deep learning", "algorithm", "database", "software"],
-    "Biomedical & Medicine": ["medical", "clinical", "disease", "health", "patient", "treatment", "diagnosis", "drug", "therapy", "biomedical"],
-    "Physics & Materials": ["physics", "quantum", "particle", "material", "electromagnetic", "relativity"],
-    "Chemistry": ["chemistry", "chemical", "reaction", "molecule", "compound", "synthesis", "organic"],
-    "Engineering": ["engineering", "mechanical", "electrical", "civil", "infrastructure"],
-    "Mathematics": ["mathematics", "mathematical", "proof", "theorem", "equation", "calculus"],
-    "Economics & Business": ["economics", "economic", "business", "financial", "market", "trade"],
-    "Environmental Science": ["environmental", "ecology", "sustainable", "pollution", "climate", "conservation"],
-    "Social Sciences": ["social", "sociology", "anthropology", "psychology", "culture", "society"]
-}
-
-# Extract text
-def extract_text_from_pdf(file):
-    if hasattr(file, "read"):
-        file_bytes = file.read()
-    else:
-        file_bytes = file
-
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
-    text = ""
-    for page in doc:
-        text += page.get_text()
-    return text
-
-
-def hash_bytes(value):
-    if isinstance(value, str):
-        value = value.encode("utf-8")
-    return hashlib.sha256(value).hexdigest()
-
-
-def cache_get_json(key):
-    try:
-        cached_value = redis_connection.get(key)
-    except Exception:
-        return None
-
-    if not cached_value:
-        return None
-
-    if isinstance(cached_value, bytes):
-        cached_value = cached_value.decode("utf-8")
-
-    try:
-        return json.loads(cached_value)
-    except json.JSONDecodeError:
-        return None
-
-
-def cache_set_json(key, value, ttl_seconds):
-    redis_connection.setex(key, ttl_seconds, json.dumps(value))
-
-
-# process_paper_analysis moved to analysis_tasks.py
-
-
-# Extract features
-def extract_features(text):
-    words = text.split()
-
-    if len(words) == 0:
-        return {
-            "word_count": 0,
-            "sentence_count": 0,
-            "avg_word_length": 0,
-            "readability": 50
-        }
-
-    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
-    sentence_count = len([sentence for sentence in sentences if sentence])
-
-    return {
-        "word_count": len(words),
-        "sentence_count": sentence_count,
-        "avg_word_length": sum(len(word) for word in words) / len(words),
-        "readability": 50
-    }
-
-
-def sanitize_text(value, max_length=200000):
-    if value is None:
-        return ""
-
-    cleaned = str(value).replace("\x00", "").strip()
-    return cleaned[:max_length]
-
-
-@app.route("/analyze", methods=["POST"])
-def analyze():
-    try:
-        file = request.files.get("file")
-
-        if not file:
-            return jsonify({"error": "No file uploaded"}), 400
-
-        if file.mimetype != "application/pdf":
-            return jsonify({"error": "Only PDF files are allowed"}), 400
-
-        file_bytes = file.read()
-        job = analysis_queue.enqueue(
-            process_paper_analysis,
-            file_bytes,
-            file.filename,
-            job_timeout=int(os.getenv("ANALYSIS_JOB_TIMEOUT_SECONDS", "300")),
-            result_ttl=ANALYSIS_CACHE_TTL_SECONDS,
-            failure_ttl=7 * 24 * 60 * 60,
-            retry=Retry(max=2, interval=[10, 30]),
-        )
-        job.meta["file_name"] = file.filename
-        job.save_meta()
-
-        return jsonify({
-            "job_id": job.id,
-            "status": job.get_status(),
-            "status_url": f"/status/{job.id}",
-        }), 202
-
-    except Exception as e:
-        return jsonify({"error": "Failed to enqueue analysis"}), 500
-
-
-# Detect paper domain and get domain statistics
-
-from domain_detection import get_domain_stats
-
-
-def get_domain_stats_app(text):
-    # shared implementation (kept for compatibility)
-    return get_domain_stats(text, dataset)
-
-
-
-# Extract or generate summary
-def extract_summary(text, max_sentences=5):
-    """
-    Extract abstract if available, otherwise generate extractive summary
-    """
-    # Try to find abstract section
-    abstract_patterns = [
-        r'(?i)abstract\s*\n(.*?)(?=introduction|1\.|keywords)',
-        r'(?i)abstract\s*\n(.*?)(?=\n\n[A-Z])',
-        r'(?i)abstract:(.*?)(?=introduction|1\.|keywords)',
-    ]
-
-    for pattern in abstract_patterns:
-        match = re.search(pattern, text, re.DOTALL)
-        if match:
-            abstract = match.group(1).strip()
-            # Clean up the abstract
-            abstract = ' '.join(abstract.split())
-            if len(abstract) > 100:  # Only use if substantial
-                return abstract[:500] + "..." if len(abstract) > 500 else abstract
-
-    # If no abstract found, use extractive summarization
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    sentences = [s.strip() for s in sentences if len(s.strip()) > 20]
-
-    if len(sentences) == 0:
-        return "Unable to extract summary from the paper."
-
-    # Score sentences based on word frequency
-    words = re.findall(r'\w+', text.lower())
-    word_freq = Counter(words)
-
-    # Remove common stop words
-    stop_words = {
-        'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
-        'of', 'with', 'by', 'from', 'is', 'are', 'was', 'were', 'be', 'been',
-        'have', 'has', 'do', 'does', 'did', 'will', 'would', 'could', 'should',
-        'this', 'that', 'these', 'those', 'i', 'you', 'he', 'she', 'it', 'we',
-        'they', 'what', 'which', 'who', 'when', 'where', 'why', 'how'
-    }
-
-    # Calculate sentence scores
-    sentence_scores = {}
-    for i, sentence in enumerate(sentences[:50]):  # Consider first 50 sentences
-        score = 0
-        words_in_sentence = re.findall(r'\w+', sentence.lower())
-        for word in words_in_sentence:
-            if word not in stop_words:
-                score += word_freq.get(word, 0)
-        sentence_scores[i] = score
-
-    # Get top sentences
-    top_sentence_indices = sorted(sentence_scores, key=sentence_scores.get, reverse=True)[:max_sentences]
-    top_sentence_indices.sort()  # Maintain order
-
-    summary_sentences = [sentences[i] for i in top_sentence_indices]
-    summary = ' '.join(summary_sentences)
-
-    # Limit summary length
-    if len(summary) > 500:
-        summary = summary[:500] + "..."
-
-    return summary
-
-# Generate recommendations based on paper analysis
-def generate_recommendations(text, features, score):
-    """
-    Generate specific recommendations based on paper analysis
-    """
-    recommendations = []
-    word_count = features.get("word_count", 0)
-    sentence_count = features.get("sentence_count", 0)
-    avg_word_length = features.get("avg_word_length", 0)
-
-    # Word count analysis
-    if word_count < 2000:
-        recommendations.append({
-            "title": "Expand Content",
-            "description": f"Your paper has {word_count} words. Consider expanding to at least 3,000-5,000 words for a comprehensive research paper. Add more detail to methodology, results, and discussion sections."
-        })
-    elif word_count > 15000:
-        recommendations.append({
-            "title": "Optimize Length",
-            "description": f"Your paper has {word_count} words, which may be too lengthy. Consider condensing or removing redundant sections while maintaining key information and research quality."
-        })
-    else:
-        recommendations.append({
-            "title": "Content Length",
-            "description": f"Your paper's word count ({word_count} words) is within a good range for research papers. Focus on maintaining quality over quantity."
-        })
-
-    # Sentence structure analysis
-    if word_count > 0 and sentence_count > 0:
-        avg_sentence_length = word_count / sentence_count
-        if avg_sentence_length > 30:
-            recommendations.append({
-                "title": "Simplify Sentence Structure",
-                "description": f"Average sentence length is {avg_sentence_length:.1f} words, which may reduce readability. Break down complex sentences into shorter, clearer statements for better comprehension."
-            })
-        elif avg_sentence_length < 10:
-            recommendations.append({
-                "title": "Enhance Sentence Variety",
-                "description": f"Average sentence length is {avg_sentence_length:.1f} words. Try varying sentence length and structure to improve flow and maintain reader engagement."
-            })
-
-    # Vocabulary analysis
-    if avg_word_length < 4.5:
-        recommendations.append({
-            "title": "Enhance Academic Vocabulary",
-            "description": f"Average word length is {avg_word_length:.1f} characters. Consider using more sophisticated academic terminology to elevate the scholarly tone of your paper."
-        })
-    elif avg_word_length > 6:
-        recommendations.append({
-            "title": "Improve Clarity",
-            "description": f"Average word length is {avg_word_length:.1f} characters. Some words may be overly complex. Balance technical terminology with clear explanations for accessibility."
-        })
-
-    # Score-based recommendations
-    if score < 5:
-        recommendations.append({
-            "title": "Critical Improvements Needed",
-            "description": "Your paper scored below 5/10. Focus on strengthening the methodology, providing clear research objectives, and improving overall organization and presentation quality."
-        })
-    elif score < 7:
-        recommendations.append({
-            "title": "Strengthen Key Sections",
-            "description": "Your paper has good potential. Enhance the introduction with clearer thesis statement, expand the literature review, and provide more detailed analysis in the results section."
-        })
-    elif score < 8.5:
-        recommendations.append({
-            "title": "Polish for Excellence",
-            "description": "Your paper is strong! Focus on minor refinements: enhance abstract clarity, add more citations, review formatting consistency, and ensure all tables/figures are well-labeled."
-        })
-    else:
-        recommendations.append({
-            "title": "Excellent Work",
-            "description": "Your paper demonstrates high quality. Consider submitting to peer-reviewed venues or academic conferences. Continue maintaining this level of academic rigor."
-        })
-
-    # Repetition analysis
-    words = text.split()
-    if len(words) > 0:
-        unique_ratio = len(set(words)) / len(words)
-        if unique_ratio < 0.5:
-            recommendations.append({
-                "title": "Reduce Repetition",
-                "description": "Your paper shows significant word repetition. Use synonyms and varied expressions to improve readability and maintain reader interest throughout the paper."
-            })
-
-    # Check for common issues
-    if "conclusion" not in text.lower():
-        recommendations.append({
-            "title": "Add Conclusion Section",
-            "description": "Your paper appears to lack a formal conclusion. Add a strong conclusion section that summarizes findings, implications, and suggests future research directions."
-        })
-
-    if len(re.findall(r'\[\d+\]|cite|ref', text, re.IGNORECASE)) < 5:
-        recommendations.append({
-            "title": "Increase Citations",
-            "description": "Your paper has minimal citations. Strengthen your research by citing relevant literature and establishing connections to existing work in your field."
-        })
-
-    return recommendations
-
-
-@app.route("/predict", methods=["POST"])
-def predict():
-    """DEPRECATED: legacy synchronous analysis endpoint.
-
-    This route is NOT used by the frontend. The live analysis flow is:
-      React app -> POST /api/analyze (Node backend) -> enqueues a job on Redis/RQ
-      -> analysis_tasks.process_paper_analysis() (see analysis_tasks.py)
-      -> React app polls GET /api/status/:jobId until the job finishes.
-
-    /predict is kept only because it has its own test coverage
-    (tests/test_app_py.py) and removing it isn't worth the risk right now.
-    Do not add new features here — add them to analysis_tasks.py instead,
-    or this route's output (e.g. missing "reference_papers") will silently
-    drift out of sync with the real result shape the frontend expects.
-    """
-    try:
-        file = request.files.get("file")
-
-        if not file:
-            return jsonify({"error": "No file uploaded"}), 400
-
-        if file.mimetype != "application/pdf":
-            return jsonify({"error": "Only PDF files are allowed"}), 400
-
-        file_bytes = file.read()
-        # Cache key based strictly on uploaded bytes
-        file_hash = hashlib.sha256(file_bytes).hexdigest()
-
-        cached_result = cache_get_json(f"analysis:{file_hash}")
-        if cached_result:
-            cached_result["cached"] = True
-            return jsonify(cached_result), 200
-
-        text = extract_text_from_pdf(file_bytes)
-
-
-        # Extract summary early
-        summary = extract_summary(text)
-
-        features = extract_features(text)
-        features_df = pd.DataFrame([features])
-
-        # Get domain statistics
-        domain_stats = get_domain_stats_app(text)
-
-        # Check if model is loaded, use default score if not
-        if model is None:
-            print("Warning: Model not loaded, using default scoring")
-            score = 6.5  # Default middle score
-        else:
-            score = float(model.predict(features_df)[0])
-
-        # 🔥 repetition penalty
-        words = text.split()
-        if len(words) > 0:
-            unique_ratio = len(set(words)) / len(words)
-            if unique_ratio < 0.4:
-                score -= 2
-
-        score = max(0.0, min(10.0, float(score)))
-
-        # Generate recommendations based on analysis
-        recommendations = generate_recommendations(text, features, score)
-
-        # Similarity matching (best-effort, narrow + shared)
-        similar_papers = []
-        try:
-            from similarity_matching import compute_similar_papers
-
-            domain_for_similarity = domain_stats.get("domain") if isinstance(domain_stats, dict) else None
-
-            similar_papers = compute_similar_papers(
-                paper_text=text,
-                dataset=dataset,
-                detected_domain=domain_for_similarity,
-                top_k=5,
-                prefilter_threshold=20,
-            )
-
-            # Strip debug-only breadcrumb
-            for sp in similar_papers:
-                sp.pop("_used_full_set", None)
-        except Exception as e:
-            print(f"Similarity matching failed: {e}")
-
-
-        result = {
-            "score": float(score),
-            "features": features,
-            "similar_papers": similar_papers,
-            "summary": summary,
-            "recommendations": recommendations,
-            "domain_stats": domain_stats,
-            "cached": False,
-        }
-
-
-        # TTL: 24 hours
-        cache_set_json(f"analysis:{file_hash}", result, 24 * 60 * 60)
-
-        return jsonify(result)
-
-    except Exception as e:
-
-        print(f"Error in predict endpoint: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({
-            "error": f"Failed to analyze paper: {str(e)}"
-        }), 500
-
-
-@app.route("/status/<job_id>", methods=["GET"])
-def status(job_id):
-    try:
+        uuid.UUID(job_id)
         job = Job.fetch(job_id, connection=redis_connection)
-    except NoSuchJobError:
-        return jsonify({"error": "Job not found"}), 404
+    except (ValueError, NoSuchJobError):
+        return None
+    if job.meta.get('owner_key') != request.headers.get('X-Owner-Key') or redis_connection.exists(f'deleted:{job_id}'):
+        return None
+    return job
 
-    payload = {
-        "job_id": job_id,
-        "status": job.get_status(),
-        "file_name": job.meta.get("file_name"),
-        "stage": job.meta.get("stage"),
-    }
+def public_result(result):
+    return {k: v for k, v in (result or {}).items() if not k.startswith('_')}
 
+@app.get('/health')
+def health():
+    from reference_papers_similarity import _get_pool
+    from semantic_matching import model_status
+    workers = Worker.all(connection=redis_connection)
+    pool = _get_pool()
+    database = False
+    if pool:
+        connection = pool.getconn()
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute('SELECT 1')
+            database = True
+        finally:
+            connection.rollback()
+            pool.putconn(connection)
+    ready = bool(workers) and database
+    return jsonify(status='ok' if ready else 'degraded', redis=bool(redis_connection.ping()), database=database,
+                   workers=len(workers), queue=analysis_queue.count, model=model_status()), 200 if ready else 503
 
+@app.post('/analyze')
+def analyze():
+    file = request.files.get('file')
+    if not file:
+        return jsonify(error='No file uploaded'), 400
+    blob = file.read()
+    if not blob.startswith(b'%PDF-'):
+        return jsonify(error='Upload a valid PDF file'), 400
+    if len(blob) > 15 * 1024 * 1024:
+        return jsonify(error='PDF must be 15MB or smaller'), 413
+    job_id = request.headers.get('X-Job-Id', '')
+    try: uuid.UUID(job_id)
+    except ValueError: return jsonify(error='Valid job ID required'), 400
+    if analysis_queue.count >= int(os.getenv('MAX_QUEUED_JOBS', '100')):
+        return jsonify(error='Analysis queue is full. Try again later.'), 503
+    owner = request.headers['X-Owner-Key']
+    external = request.form.get('external_search') == 'true'
+    digest = hashlib.sha256(blob).hexdigest()
+    cache_key = 'analysis:' + hashlib.sha256(f'{ANALYSIS_VERSION}:{owner}:{digest}:{external}'.encode()).hexdigest()
+    redis_connection.setex(f'upload:{job_id}', 900, blob)
+    try:
+        # Cached jobs still use the same queue/status contract and ownership checks.
+        job = analysis_queue.enqueue(process_uploaded_paper, job_id, file.filename, external,
+            job_id=job_id, job_timeout=int(os.getenv('ANALYSIS_JOB_TIMEOUT_SECONDS', '300')),
+            ttl=600, result_ttl=TTL, failure_ttl=3600,
+            meta={'owner_key': owner, 'file_name': file.filename, 'cache_key': cache_key, 'file_hash': digest})
+    except Exception:
+        redis_connection.delete(f'upload:{job_id}')
+        raise
+    return jsonify(job_id=job.id, status=job.get_status()), 202
+
+@app.get('/status/<job_id>')
+def status(job_id):
+    job = owned_job(job_id)
+    if not job: return jsonify(error='Analysis not found or expired'), 404
+    state = job.get_status()
+    if state in ('stopped', 'canceled'): state = 'cancelled'
+    payload = {'job_id': job.id, 'status': state, 'stage': job.meta.get('stage'), 'file_name': job.meta.get('file_name')}
     if job.is_finished:
-        payload["result"] = job.result
-        file_hash = job.meta.get("file_hash")
-        if file_hash and job.result:
-            cache_set_json(f"analysis:{file_hash}", job.result, ANALYSIS_CACHE_TTL_SECONDS)
-    elif job.is_failed:
-        payload["error"] = "Analysis job failed"
-
+        payload['result'] = public_result(job.result)
+    if job.is_failed:
+        payload['error'] = job.meta.get('safe_error', 'Analysis failed or timed out. Check that the PDF contains readable text and try again.')
     return jsonify(payload)
 
+@app.delete('/jobs/<job_id>')
+def delete_job(job_id):
+    job = owned_job(job_id)
+    if not job:
+        # Gateway has already checked database ownership; deletion is idempotent after expiry.
+        return jsonify(ok=True)
+    redis_connection.setex(f'deleted:{job_id}', TTL, '1')
+    if job.get_status() == 'started':
+        try: send_stop_job_command(redis_connection, job.id)
+        except Exception: pass
+    else:
+        job.cancel()
+    keys = [f'upload:{job_id}', job.meta.get('cache_key', '')]
+    redis_connection.delete(*[k for k in keys if k])
+    job.delete()
+    return jsonify(ok=True)
 
-@app.route("/recommend", methods=["POST"])
+@lru_cache(maxsize=1)
+def venue_database():
+    from recommender_full import load_venue_database_enhanced
+    return load_venue_database_enhanced()
+
+@app.post('/recommend')
 def recommend():
-    data = request.get_json(silent=True) or {}
-    if not data and request.form:
-        data = request.form.to_dict(flat=True)
-
-    paper_text = data.get("paper_text", "")
-    if not paper_text:
-        file = request.files.get("file")
-        if file:
-            if file.mimetype != "application/pdf":
-                return jsonify({"error": "Only PDF files are allowed"}), 400
-            paper_text = extract_text_from_pdf(file.read())
-
-    paper_text = sanitize_text(paper_text)
-    paper_score = data.get("paper_score", 5.0)
-    try:
-        paper_score = float(paper_score)
-    except Exception:
-        paper_score = 5.0
-    paper_topic = data.get("paper_topic", "")
-
-    venue_type = data.get("venue_type", "any")
-    indexing = data.get("indexing", ["Any"])
-    fee_pref = data.get("fee_pref", "Any")
-    acceptance = data.get("acceptance", "Any")
-
-    # preferences object for enhanced recommender (keep it simple for now)
-    prefs = {
-        "venue_type": venue_type,
-        "indexing": indexing,
-        "fee_pref": fee_pref,
-        "acceptance": acceptance,
-        "open_access_only": data.get("open_access_only", False),
-        "exclude_discontinued": data.get("exclude_discontinued", False),
-        "medline_only": data.get("medline_only", False),
-        "min_coverage_year": data.get("min_coverage_year", 2000),
-        "publisher": data.get("publisher", "any"),
-        "selected_subjects": data.get("selected_subjects", []),
-    }
-
-    if not paper_text or len(str(paper_text).strip()) < 50:
-        return jsonify({"error": "paper_text must be at least 50 characters"}), 400
-
-    cache_payload = {
-        "paper_text": paper_text,
-        "paper_score": paper_score,
-        "paper_topic": paper_topic,
-        "preferences": prefs,
-    }
-
-    # Stable cache key for recommendation results
-    cache_key = f"recommend:{hash_bytes(json.dumps(cache_payload, sort_keys=True, default=str))}"
-
-    cached_result = cache_get_json(cache_key)
-    if cached_result:
-        cached_result["cached"] = True
-        return jsonify(cached_result), 200
-
-
-    if recommend_venues_enhanced is None or venue_db is None or getattr(venue_db, "empty", False):
-        return jsonify({"error": "Venue database not available. Try again later."}), 503
-
-
-    try:
-        result = recommend_venues_enhanced(
-            paper_text=paper_text,
-            paper_score=paper_score,
-            paper_topic=paper_topic,
-            preferences=prefs,
-            venue_db=venue_db,
-            top_n=10,
-        )
-
-        reference_top_k = data.get("reference_top_k", 5)
-        try:
-            reference_top_k = int(reference_top_k)
-        except Exception:
-            reference_top_k = 5
-
-        reference_top_k = max(1, min(reference_top_k, 20))
-        reference_papers = get_reference_similar_papers(paper_text, top_k=reference_top_k)
-
-        if isinstance(result, dict):
-            result["reference_papers"] = reference_papers
-        else:
-            result = {
-                "venues": result,
-                "reference_papers": reference_papers,
-            }
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-    cache_set_json(cache_key, result, RECOMMENDATION_CACHE_TTL_SECONDS)
-
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict): return jsonify(error='JSON object required'), 400
+    job = owned_job(str(data.get('job_id', '')))
+    if not job or not job.is_finished: return jsonify(error='Completed analysis not found'), 404
+    text = (job.result or {}).get('_matching_text')
+    if not text: return jsonify(error='Matching text expired. Analyze the PDF again.'), 410
+    from recommender_full import recommend_venues_enhanced, validate_preferences
+    prefs = validate_preferences(data)
+    result = recommend_venues_enhanced(text, None, '', prefs, venue_database())
     return jsonify(result)
 
+@app.post('/venues')
+def venue_directory():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict): return jsonify(error='JSON object required'), 400
+    from recommender_full import list_venues
+    return jsonify(list_venues(data, venue_database()))
 
-if __name__ == "__main__":
-    app.run(host=flask_host, port=flask_port)
+@app.post('/predict')
+def retired_predict():
+    return jsonify(error='Use the asynchronous /api/analyze endpoint'), 410
+
+@app.errorhandler(ValueError)
+def invalid_request(error):
+    return jsonify(error=str(error)), 400
+
+@app.errorhandler(RedisError)
+def redis_unavailable(error):
+    return jsonify(error='Queue service unavailable'), 503
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify(error='Analysis service unavailable'), 500

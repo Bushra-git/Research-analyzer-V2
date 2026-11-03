@@ -1,0 +1,91 @@
+{
+  "limitations": "Small authored smoke set. Not independent expert evaluation or evidence of scientific quality.",
+  "results": [
+    {
+      "requested_method": "tfidf",
+      "mrr": 0.888888888888889,
+      "recall_at_3": 1.0,
+      "cases": [
+        {
+          "id": "clinical",
+          "rank": 1,
+          "method": "tfidf",
+          "warning": null
+        },
+        {
+          "id": "software",
+          "rank": 1,
+          "method": "tfidf",
+          "warning": null
+        },
+        {
+          "id": "ecology",
+          "rank": 3,
+          "method": "tfidf",
+          "warning": null
+        },
+        {
+          "id": "energy",
+          "rank": 1,
+          "method": "tfidf",
+          "warning": null
+        },
+        {
+          "id": "education",
+          "rank": 1,
+          "method": "tfidf",
+          "warning": null
+        },
+        {
+          "id": "agriculture",
+          "rank": 1,
+          "method": "tfidf",
+          "warning": null
+        }
+      ]
+    },
+    {
+      "requested_method": "hybrid",
+      "mrr": 1.0,
+      "recall_at_3": 1.0,
+      "cases": [
+        {
+          "id": "clinical",
+          "rank": 1,
+          "method": "hybrid",
+          "warning": null
+        },
+        {
+          "id": "software",
+          "rank": 1,
+          "method": "hybrid",
+          "warning": null
+        },
+        {
+          "id": "ecology",
+          "rank": 1,
+          "method": "hybrid",
+          "warning": null
+        },
+        {
+          "id": "energy",
+          "rank": 1,
+          "method": "hybrid",
+          "warning": null
+        },
+        {
+          "id": "education",
+          "rank": 1,
+          "method": "hybrid",
+          "warning": null
+        },
+        {
+          "id": "agriculture",
+          "rank": 1,
+          "method": "hybrid",
+          "warning": null
+        }
+      ]
+    }
+  ]
+}

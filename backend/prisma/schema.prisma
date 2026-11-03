@@ -22,14 +22,20 @@ model Analysis {
   jobId           String?  @unique
   userId          String?
   paperFilename   String
-  extractedScore  Float
+  extractedScore  Float?
   features        Json
   summary         String   @db.Text
   createdAt       DateTime @default(now())
+  ownerKey        String?
+  status          String   @default("queued")
+  result          Json?
+  expiresAt       DateTime @default(now())
 
   user            User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
 
   @@index([createdAt])
+  @@index([ownerKey, createdAt])
+  @@index([expiresAt])
 }
 
 model CachedRecommendation {

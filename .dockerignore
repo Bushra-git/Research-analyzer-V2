@@ -7,4 +7,12 @@ __pycache__/
 frontend/node_modules/
 backend/node_modules/
 .env
+.env.*
+!.env.example
+.venv/
+.tools/
+**/.npm-cache/
+models/all-MiniLM-L6-v2/
+frontend/build/
+model.pkl
 

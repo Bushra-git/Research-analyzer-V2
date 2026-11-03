@@ -1,0 +1,22 @@
+{
+  "limitations": "Synthetic keyword-gate regression with repeated chemistry distractors. Not a held-out benchmark or evidence of general model accuracy.",
+  "candidate_count": 221,
+  "old_lexical_gate_retains_relevant_paper": false,
+  "full_corpus_relevant_rank": 1,
+  "full_corpus_recall_at_5": 1,
+  "cold_seconds": 21.765,
+  "diagnostics": {
+    "method": "hybrid",
+    "model": "sentence-transformers/all-MiniLM-L6-v2",
+    "semantic_weight": 0.7,
+    "lexical_weight": 0.3,
+    "warning": null
+  },
+  "model": {
+    "model": "sentence-transformers/all-MiniLM-L6-v2",
+    "installed": true,
+    "loaded": true,
+    "enabled": true,
+    "fallback_reason": null
+  }
+}

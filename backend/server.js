@@ -1,381 +1,181 @@
-const express = require("express");
-const axios = require("axios");
-const cors = require("cors");
-const multer = require("multer");
-const FormData = require("form-data");
-const helmet = require("helmet");
-const rateLimit = require("express-rate-limit");
-const crypto = require("crypto");
-const bcrypt = require("bcryptjs");
-const jwt = require("jsonwebtoken");
-const { PrismaClient } = require("@prisma/client");
-require("dotenv").config();
+const express = require('express');
+const axios = require('axios');
+const cors = require('cors');
+const multer = require('multer');
+const FormData = require('form-data');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+require('dotenv').config();
+require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
+const COOKIE = 'research_session';
+const fail = (status, message) => Object.assign(new Error(message), { status });
 
-const app = express();
-app.set("trust proxy", 1);
-const prisma = new PrismaClient();
-
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || "http://localhost:3000,http://localhost:3001")
-  .split(",")
-  .map((origin) => origin.trim())
-  .filter(Boolean);
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 15 * 1024 * 1024,
-  },
-  fileFilter: (req, file, cb) => {
-    if (file.mimetype !== "application/pdf") {
-      return cb(new Error("Only PDF files are allowed"));
-    }
-
-    cb(null, true);
-  },
-});
-const FLASK_API_URL = process.env.FLASK_API_URL;
-const PORT = Number(process.env.BACKEND_PORT || process.env.PORT);
-const JWT_SECRET = process.env.JWT_SECRET;
-const GUEST_ANALYZE_LIMIT = Number(process.env.GUEST_ANALYZE_LIMIT || 2);
-
-if (!FLASK_API_URL) {
-  throw new Error("Missing FLASK_API_URL in backend environment");
-}
-
-if (!PORT) {
-  throw new Error("Missing BACKEND_PORT in backend environment");
-}
-
-if (!JWT_SECRET) {
-  throw new Error("Missing JWT_SECRET in backend environment");
-}
-
-app.use(helmet());
-app.use(
-  cors({
-    origin: (origin, callback) => {
-      if (!origin || allowedOrigins.includes(origin)) {
-        return callback(null, true);
-      }
-
-      return callback(new Error("CORS origin not allowed"));
-    },
-    methods: ["GET", "POST", "OPTIONS"],
-  })
-);
-// Rate limit only expensive/abusable endpoints.
-// Polling (/api/status/:jobId) is intentionally excluded because it is frequent/low-cost.
-const apiRateLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 1000,
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-
-app.use(express.json({ limit: "10mb" }));
-
-app.post('/api/analyze', apiRateLimiter);
-app.post('/api/recommend', apiRateLimiter);
-
-const getAuthenticatedUser = async (req) => {
-  const header = req.headers.authorization || "";
-  if (!header.startsWith("Bearer ")) return null;
-
-  try {
-    const payload = jwt.verify(header.slice(7), JWT_SECRET);
-    return prisma.user.findUnique({ where: { id: payload.sub } });
-  } catch (_error) {
-    return null;
+function configuration(env = process.env) {
+  for (const name of ['JWT_SECRET', 'INTERNAL_API_TOKEN']) {
+    if (!env[name] || env[name].length < 32 || /change-this|replace-with/.test(env[name])) throw new Error(`${name} must be a random secret of at least 32 characters`);
   }
-};
-
-const normalizeIp = (value) => String(value || "unknown").replace("::ffff:", "").trim() || "unknown";
-
-const getClientIp = (req) => {
-  const forwarded = req.headers["x-forwarded-for"];
-  if (typeof forwarded === "string" && forwarded.length > 0) {
-    return normalizeIp(forwarded.split(",")[0]);
-  }
-
-  return normalizeIp(req.ip || req.socket?.remoteAddress);
-};
-
-const getGuestAnalyzeUsage = async (ip) => {
-  const record = await prisma.guestUsage.findUnique({ where: { ip } });
-  return record?.analysesUsed || 0;
-};
-
-const incrementGuestAnalyzeUsage = async (ip) => {
-  const record = await prisma.guestUsage.upsert({
-    where: { ip },
-    update: { analysesUsed: { increment: 1 } },
-    create: { ip, analysesUsed: 1 },
+  if (!env.FLASK_API_URL) throw new Error('FLASK_API_URL is required');
+  const guestLimit = Number(env.GUEST_ANALYZE_LIMIT || 2);
+  const retentionHours = Number(env.RETENTION_HOURS || 24);
+  if (!Number.isInteger(guestLimit) || guestLimit < 1 || !Number.isInteger(retentionHours) || retentionHours < 1 || retentionHours > 168) throw new Error('Invalid guest limit or retention hours (1–168)');
+  return { jwtSecret: env.JWT_SECRET, internalToken: env.INTERNAL_API_TOKEN,
+    flaskUrl: env.FLASK_API_URL, secureCookies: env.NODE_ENV === 'production',
+    origins: (env.ALLOWED_ORIGINS || 'http://localhost:3000').split(',').map(s => s.trim()),
+    trustedProxies: env.TRUSTED_PROXIES ? env.TRUSTED_PROXIES.split(',') : false,
+    guestLimit, retentionHours };
+}
+function createApp({ prisma, http = axios, config = configuration() }) {
+  const app = express();
+  app.set('trust proxy', config.trustedProxies);
+  app.use(helmet());
+  app.use(cors({ origin: config.origins, credentials: true, methods: ['GET', 'POST', 'DELETE'], exposedHeaders: ['X-Guest-Analyses-Used', 'X-Guest-Analyses-Limit'] }));
+  app.use(express.json({ limit: '256kb' }));
+  app.use((req, res, next) => {
+    res.set('Cache-Control', 'no-store');
+    if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method) && req.headers.origin && !config.origins.includes(req.headers.origin)) return next(fail(403, 'Origin not allowed'));
+    next();
   });
-  return record.analysesUsed;
-};
-
-app.post("/api/auth/register", apiRateLimiter, async (req, res) => {
-  const email = String(req.body?.email || "").trim().toLowerCase();
-  const password = String(req.body?.password || "");
-  const name = String(req.body?.name || "").trim() || null;
-
-  if (!/^\S+@\S+\.\S+$/.test(email) || password.length < 10) {
-    return res.status(400).json({ error: "Valid email and password of at least 10 characters are required" });
+  const expensiveLimit = rateLimit({ windowMs: 900000, limit: 30, standardHeaders: 'draft-7', legacyHeaders: false });
+  const authLimit = rateLimit({ windowMs: 900000, limit: 20, standardHeaders: 'draft-7', legacyHeaders: false });
+  const readLimit = rateLimit({ windowMs: 60000, limit: 120, standardHeaders: 'draft-7', legacyHeaders: false });
+  const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024, files: 1, fields: 2 } });
+  function setSession(res, claims) {
+    res.cookie(COOKIE, jwt.sign(claims, config.jwtSecret, { expiresIn: '1d', issuer: 'research-analyzer', audience: 'browser' }),
+      { httpOnly: true, secure: config.secureCookies, sameSite: 'strict', path: '/', maxAge: 86400000 });
   }
-
-  try {
-    const passwordHash = await bcrypt.hash(password, 12);
-    const user = await prisma.user.create({ data: { email, name, passwordHash } });
-    const token = jwt.sign({ sub: user.id, email: user.email }, JWT_SECRET, { expiresIn: "7d" });
-    return res.status(201).json({ token, user: { id: user.id, email: user.email, name: user.name } });
-  } catch (error) {
-    if (error.code === "P2002") return res.status(409).json({ error: "Email is already registered" });
-    console.error("Registration error:", error.message);
-    return res.status(500).json({ error: "Failed to register" });
-  }
-});
-
-app.post("/api/auth/login", apiRateLimiter, async (req, res) => {
-  const email = String(req.body?.email || "").trim().toLowerCase();
-  const password = String(req.body?.password || "");
-  const user = await prisma.user.findUnique({ where: { email } });
-  const valid = user?.passwordHash && await bcrypt.compare(password, user.passwordHash);
-
-  if (!valid) return res.status(401).json({ error: "Invalid email or password" });
-  const token = jwt.sign({ sub: user.id, email: user.email }, JWT_SECRET, { expiresIn: "7d" });
-  return res.json({ token, user: { id: user.id, email: user.email, name: user.name } });
-});
-
-
-const validateRecommendationBody = (body) => {
-  if (!body || typeof body !== "object") {
-    return "Request body is required";
-  }
-
-  if (body.paper_text && typeof body.paper_text !== "string") {
-    return "paper_text must be a string";
-  }
-
-  if (body.paper_topic && typeof body.paper_topic !== "string") {
-    return "paper_topic must be a string";
-  }
-
-  if (body.paper_score !== undefined && Number.isNaN(Number(body.paper_score))) {
-    return "paper_score must be numeric";
-  }
-
-  return null;
-};
-
-const hashValue = (value) =>
-  crypto.createHash("sha256").update(typeof value === "string" ? value : JSON.stringify(value || {})).digest("hex");
-
-const persistAnalysis = async (jobId, fileName, responseData, userId = null) => {
-  try {
-    if (!jobId) {
-      return;
-    }
-
-    await prisma.analysis.upsert({
-      where: { jobId },
-      update: {
-        userId,
-        paperFilename: fileName || "unknown.pdf",
-        extractedScore: Number(responseData?.score || 0),
-        features: responseData?.features || {},
-        summary: responseData?.summary || "",
-      },
-      create: {
-        jobId,
-        userId,
-        paperFilename: fileName || "unknown.pdf",
-        extractedScore: Number(responseData?.score || 0),
-        features: responseData?.features || {},
-        summary: responseData?.summary || "",
-      },
-    });
-  } catch (error) {
-    console.error("Failed to persist analysis:", error.message);
-  }
-};
-
-const persistRecommendation = async (requestBody, responseData, userId = null) => {
-  try {
-    const paperText = requestBody?.paper_text || "";
-    const preferences = {
-      paper_score: requestBody?.paper_score,
-      paper_topic: requestBody?.paper_topic,
-      venue_type: requestBody?.venue_type,
-      open_access_only: requestBody?.open_access_only,
-      exclude_discontinued: requestBody?.exclude_discontinued,
-      medline_only: requestBody?.medline_only,
-      min_coverage_year: requestBody?.min_coverage_year,
-      selected_subjects: requestBody?.selected_subjects,
-      indexing: requestBody?.indexing,
-      fee_pref: requestBody?.fee_pref,
-      acceptance: requestBody?.acceptance,
-      publisher: requestBody?.publisher,
-    };
-    const paperHash = hashValue(paperText);
-    const preferencesHash = hashValue(preferences);
-    const cacheKey = `${paperHash}:${preferencesHash}`;
-    const storedRequestPayload = { ...requestBody };
-    delete storedRequestPayload.paper_text;
-    storedRequestPayload.paper_text_redacted = true;
-
-    await prisma.cachedRecommendation.upsert({
-      where: { cacheKey },
-      update: {
-        userId,
-        paperHash,
-        preferencesHash,
-        requestPayload: storedRequestPayload,
-        result: responseData,
-      },
-      create: {
-        cacheKey,
-        userId,
-        paperHash,
-        preferencesHash,
-        requestPayload: storedRequestPayload,
-        result: responseData,
-      },
-    });
-  } catch (error) {
-    console.error("Failed to persist recommendation:", error.message);
-  }
-};
-
-app.post("/api/analyze", upload.single("file"), async (req, res) => {
-  try {
-    const user = await getAuthenticatedUser(req);
-    const isGuest = !user;
-    const guestIp = isGuest ? getClientIp(req) : null;
-
-  if (isGuest && (await getGuestAnalyzeUsage(guestIp)) >= GUEST_ANALYZE_LIMIT) {
-      return res.status(403).json({
-        error: `Guest usage limit reached. You can analyze ${GUEST_ANALYZE_LIMIT} papers without login. Please sign in to continue.`,
-        requiresAuth: true,
-        guestLimit: GUEST_ANALYZE_LIMIT,
-      });
-    }
-
-    if (!req.file) {
-      return res.status(400).json({ error: "No file uploaded" });
-    }
-
-    const formData = new FormData();
-    formData.append("file", req.file.buffer, "file.pdf");
-
-    const response = await axios.post(
-      `${FLASK_API_URL}/analyze`,
-      formData,
-      {
-        headers: {
-          ...formData.getHeaders(),
-        },
-        timeout: 120000,
+  async function identity(req, res, next) {
+    try {
+      const part = (req.headers.cookie || '').split(';').map(s => s.trim()).find(s => s.startsWith(`${COOKIE}=`));
+      let claims;
+      if (part) {
+        try { claims = jwt.verify(decodeURIComponent(part.slice(COOKIE.length + 1)), config.jwtSecret, { algorithms: ['HS256'], issuer: 'research-analyzer', audience: 'browser' }); }
+        catch { res.clearCookie(COOKIE, { path: '/' }); throw fail(401, 'Session expired. Refresh and sign in again.'); }
       }
-    );
-
-    // Flask /analyze returns { job_id, status, status_url }
-    if (isGuest && guestIp) {
-      const used = await incrementGuestAnalyzeUsage(guestIp);
-      res.set("X-Guest-Analyses-Used", String(used));
-      res.set("X-Guest-Analyses-Limit", String(GUEST_ANALYZE_LIMIT));
+      if (!claims) { claims = { sub: crypto.randomUUID(), kind: 'guest' }; setSession(res, claims); }
+      if (!['guest', 'user'].includes(claims.kind) || typeof claims.sub !== 'string') throw fail(401, 'Invalid session');
+      if (claims.kind === 'user') {
+        req.user = await prisma.user.findUnique({ where: { id: claims.sub }, select: { id: true, email: true, name: true } });
+        if (!req.user) throw fail(401, 'Account no longer exists');
+      }
+      req.ownerKey = `${claims.kind}:${claims.sub}`;
+      req.quotaKey = crypto.createHmac('sha256', config.jwtSecret).update(req.ip || 'unknown').digest('hex');
+      next();
+    } catch (error) { next(error); }
+  }
+  app.use('/api', identity);
+  const internal = ownerKey => ({ 'X-Internal-Token': config.internalToken, 'X-Owner-Key': ownerKey });
+  async function owned(req) {
+    const row = await prisma.analysis.findFirst({ where: { jobId: req.params.jobId, ownerKey: req.ownerKey, expiresAt: { gt: new Date() } } });
+    if (!row) throw fail(404, 'Analysis not found');
+    return row;
+  }
+  app.get('/api/session', readLimit, async (req, res) => {
+    const usage = req.user ? null : await prisma.guestUsage.findUnique({ where: { ip: req.quotaKey } });
+    res.json({ user: req.user || null, guestUsed: usage?.analysesUsed || 0, guestLimit: config.guestLimit, retentionHours: config.retentionHours });
+  });
+  app.post('/api/auth/logout', (req, res) => { setSession(res, { sub: crypto.randomUUID(), kind: 'guest' }); res.json({ ok: true }); });
+  app.post('/api/auth/register', authLimit, async (req, res) => {
+    const { password, name } = req.body || {};
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    if (!/^\S+@\S+\.\S+$/.test(email) || email.length > 254 || typeof password !== 'string' || password.length < 10 || Buffer.byteLength(password) > 72 || (name != null && (typeof name !== 'string' || name.length > 100))) throw fail(400, 'Use a valid email, a 10–72 byte password, and a name up to 100 characters');
+    try {
+      const user = await prisma.user.create({ data: { email, name: name?.trim() || null, passwordHash: await bcrypt.hash(password, 12) }, select: { id: true, email: true, name: true } });
+      setSession(res, { sub: user.id, kind: 'user' }); res.status(201).json({ user });
+    } catch (error) { if (error.code === 'P2002') throw fail(409, 'Email is already registered'); throw error; }
+  });
+  app.post('/api/auth/login', authLimit, async (req, res) => {
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    const password = req.body?.password;
+    if (typeof password !== 'string' || Buffer.byteLength(password) > 72 || email.length > 254) throw fail(400, 'Invalid credentials');
+    const user = await prisma.user.findUnique({ where: { email } });
+    if (!user?.passwordHash || !await bcrypt.compare(password, user.passwordHash)) throw fail(401, 'Invalid email or password');
+    setSession(res, { sub: user.id, kind: 'user' }); res.json({ user: { id: user.id, email: user.email, name: user.name } });
+  });
+  app.post('/api/analyze', expensiveLimit, upload.single('file'), async (req, res) => {
+    if (!req.file || req.file.buffer.subarray(0, 5).toString() !== '%PDF-') throw fail(400, 'Upload a valid PDF file');
+    const jobId = crypto.randomUUID();
+    let reserved = false, used = 0;
+    if (!req.user) {
+      const rows = await prisma.$queryRaw`
+        INSERT INTO guest_usage (ip, analyses_used, updated_at) VALUES (${req.quotaKey}, 1, NOW())
+        ON CONFLICT (ip) DO UPDATE SET analyses_used = guest_usage.analyses_used + 1, updated_at = NOW()
+        WHERE guest_usage.analyses_used < ${config.guestLimit} RETURNING analyses_used`;
+      if (!rows.length) return res.status(403).json({ error: 'Guest limit reached. Sign in to continue.', requiresAuth: true });
+      reserved = true; used = rows[0].analyses_used;
     }
-
-    res.json(response.data);
-
-  } catch (error) {
-    const status = error.response?.status || 500;
-    const message = error.response?.data?.error || error.message || "Error processing file";
-    console.error("Analyze error:", message);
-    res.status(status).json({ error: message });
-  }
-});
-
-app.get("/api/status/:jobId", async (req, res) => {
-  res.set("Cache-Control", "no-store");
-  try {
-    const response = await axios.get(`${FLASK_API_URL}/status/${req.params.jobId}`, {
-      timeout: 120000,
-    });
-
-    if (response.data?.status === "finished" && response.data?.result) {
-      const user = await getAuthenticatedUser(req);
-      void persistAnalysis(response.data.job_id, response.data.file_name, response.data.result, user?.id);
+    const filename = req.file.originalname.replace(/[\x00-\x1f\/\\]/g, '_').slice(0, 200);
+    try {
+      await prisma.analysis.create({ data: { jobId, ownerKey: req.ownerKey, userId: req.user?.id || null, paperFilename: filename,
+        features: {}, summary: '', status: 'queued', expiresAt: new Date(Date.now() + config.retentionHours * 3600000) } });
+      const form = new FormData();
+      form.append('file', req.file.buffer, filename);
+      form.append('external_search', req.body.external_search === 'true' ? 'true' : 'false');
+      const response = await http.post(`${config.flaskUrl}/analyze`, form, { headers: { ...form.getHeaders(), ...internal(req.ownerKey), 'X-Job-Id': jobId }, timeout: 15000 });
+      res.set('X-Guest-Analyses-Used', String(used)).set('X-Guest-Analyses-Limit', String(config.guestLimit));
+      res.status(202).json(response.data);
+    } catch (error) {
+      if (!error.response && ['ECONNABORTED', 'ECONNRESET'].includes(error.code)) return res.status(202).json({ job_id: jobId, status: 'queued', message: 'Submission uncertain; checking job status.' });
+      await prisma.analysis.deleteMany({ where: { jobId, ownerKey: req.ownerKey } });
+      if (reserved) await prisma.guestUsage.updateMany({ where: { ip: req.quotaKey, analysesUsed: { gt: 0 } }, data: { analysesUsed: { decrement: 1 } } });
+      throw error;
     }
-
-    res.json(response.data);
-  } catch (error) {
-    const status = error.response?.status || 500;
-    const message = error.response?.data?.error || error.message || "Error checking job status";
-    console.error("Status error:", message);
-    res.status(status).json({ error: message });
-  }
-});
-
-app.post("/api/recommend", async (req, res) => {
-  try {
-    const validationError = validateRecommendationBody(req.body);
-    if (validationError) {
-      return res.status(400).json({ error: validationError });
-    }
-
-    const response = await axios.post(`${FLASK_API_URL}/recommend`, req.body, {
-      timeout: 120000,
-    });
-
-    res.json(response.data);
-    const user = await getAuthenticatedUser(req);
-    void persistRecommendation(req.body, response.data, user?.id);
-  } catch (error) {
-    const status = error.response?.status || 500;
-    const message = error.response?.data?.error || error.message || "Error fetching recommendations";
-    console.error("Recommend error:", message);
-    res.status(status).json({ error: message });
-  }
-});
-
-app.use((error, req, res, next) => {
-  if (error && error.message === "Only PDF files are allowed") {
-    return res.status(400).json({ error: error.message });
-  }
-
-  if (error && error.code === "LIMIT_FILE_SIZE") {
-    return res.status(413).json({ error: "PDF file must be 15MB or smaller" });
-  }
-
-  return next(error);
-});
-
-app.use((err, req, res, next) => {
-  console.error("Unhandled server error:", err);
-  res.status(500).json({ error: "Internal server error" });
-});
-
-app.get("/api/history", async (req, res) => {
-  try {
-    const limit = Math.min(Number(req.query.limit || 25), 100);
-    const user = await getAuthenticatedUser(req);
-    const history = await prisma.analysis.findMany({
-      where: user ? { userId: user.id } : { userId: null },
-      orderBy: { createdAt: "desc" },
-      take: limit,
-    });
-
+  });
+  app.get('/api/status/:jobId', readLimit, async (req, res) => {
+    const row = await owned(req);
+    if (row.result || ['cancelled', 'failed'].includes(row.status)) return res.json({ job_id: row.jobId, status: row.status, result: row.result });
+    const { data } = await http.get(`${config.flaskUrl}/status/${req.params.jobId}`, { headers: internal(req.ownerKey), timeout: 15000 });
+    if (['finished', 'failed', 'cancelled'].includes(data.status)) await prisma.analysis.updateMany({ where: { jobId: row.jobId, ownerKey: req.ownerKey }, data: { status: data.status,
+      ...(data.result ? { result: data.result, features: data.result.features || {}, summary: data.result.summary || '' } : {}) } });
+    res.json(data);
+  });
+  app.delete('/api/analyses/:jobId', readLimit, async (req, res) => {
+    await owned(req);
+    await http.delete(`${config.flaskUrl}/jobs/${req.params.jobId}`, { headers: internal(req.ownerKey), timeout: 15000 });
+    await prisma.analysis.deleteMany({ where: { jobId: req.params.jobId, ownerKey: req.ownerKey } });
+    res.json({ ok: true });
+  });
+  app.post('/api/venues', readLimit, async (req, res) => {
+    const { data } = await http.post(`${config.flaskUrl}/venues`, req.body, { headers: internal(req.ownerKey), timeout: 30000 });
+    res.json(data);
+  });
+  app.post('/api/recommend', expensiveLimit, async (req, res) => {
+    const jobId = req.body?.job_id;
+    if (typeof jobId !== 'string') throw fail(400, 'job_id is required');
+    const row = await prisma.analysis.findFirst({ where: { jobId, ownerKey: req.ownerKey, expiresAt: { gt: new Date() } } });
+    if (!row) throw fail(404, 'Analysis not found');
+    const { data } = await http.post(`${config.flaskUrl}/recommend`, req.body, { headers: internal(req.ownerKey), timeout: 120000 });
+    res.json(data);
+  });
+  app.get('/api/history', readLimit, async (req, res) => {
+    const limit = Number(req.query.limit || 25);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw fail(400, 'limit must be 1–100');
+    const history = await prisma.analysis.findMany({ where: { ownerKey: req.ownerKey, expiresAt: { gt: new Date() } }, orderBy: { createdAt: 'desc' }, take: limit,
+      select: { jobId: true, paperFilename: true, createdAt: true, expiresAt: true, status: true, summary: true } });
     res.json({ history });
-  } catch (error) {
-    console.error("History error:", error.message);
-    res.status(500).json({ error: "Failed to load history" });
+  });
+  app.use((error, req, res, next) => {
+    if (res.headersSent) return next(error);
+    const status = error.code === 'LIMIT_FILE_SIZE' ? 413 : error.status || error.response?.status || 500;
+    const message = error.code === 'LIMIT_FILE_SIZE' ? 'PDF must be 15MB or smaller' : status < 500 ? error.response?.data?.error || error.message : 'Service unavailable. Please try again.';
+    if (status >= 500) console.error('Request failed', { path: req.path, code: error.code || 'internal' });
+    res.status(status).json({ error: message });
+  });
+  return app;
+}
+if (require.main === module) {
+  const { PrismaClient } = require('@prisma/client');
+  const prisma = new PrismaClient();
+  const app = createApp({ prisma });
+  async function cleanup() {
+    await prisma.analysis.deleteMany({ where: { expiresAt: { lte: new Date() } } });
+    await prisma.cachedRecommendation.deleteMany({ where: { OR: [{ expiresAt: null }, { expiresAt: { lte: new Date() } }] } });
   }
-});
-
-process.on("SIGINT", async () => {
-  await prisma.$disconnect();
-  process.exit(0);
-});
-
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+  cleanup().catch(() => console.error('Retention cleanup failed'));
+  const timer = setInterval(() => cleanup().catch(() => console.error('Retention cleanup failed')), 60000); timer.unref();
+  const server = app.listen(Number(process.env.BACKEND_PORT || 3001));
+  for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => { clearInterval(timer); server.close(async () => { await prisma.$disconnect(); process.exit(0); }); });
+}
+module.exports = { createApp, configuration };

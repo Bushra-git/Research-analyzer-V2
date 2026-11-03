@@ -7,8 +7,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-import analysis_tasks
-from domain_detection import get_domain_stats
+from domain_detection import DOMAIN_KEYWORDS_SIMPLE
 
 
 # Keep legacy scoring function for backwards comparison. (The debug endpoint isn’t used in production.)
@@ -31,7 +30,7 @@ def score_exact_phrase_boundaries(text: str):
     t = (text or "").lower()
     scores = {}
 
-    for domain, keywords in analysis_tasks.DOMAIN_KEYWORDS_SIMPLE.items():
+    for domain, keywords in DOMAIN_KEYWORDS_SIMPLE.items():
         total = 0
         for kw in keywords:
             kw_l = kw.lower().strip()
